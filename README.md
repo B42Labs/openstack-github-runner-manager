@@ -5,9 +5,10 @@ tear it down again, with a single Go binary. The command is called `ogrm`,
 short for *openstack-github-runner-manager*.
 
 `install.sh` (in this repository) does the *in-VM* work: it turns a fresh Ubuntu
-host into a KinD-capable GitHub Actions runner. `ogrm` does the
-*cloud* work around it: it creates the network, router, keypair, boot volumes,
-and instances, and then runs `install.sh` on every instance through cloud-init.
+host into a KinD-capable GitHub Actions runner, and installs a disk guard that
+keeps it from filling up. `ogrm` does the *cloud* work around it: it creates the
+network, router, keypair, boot volumes, and instances, and then runs
+`install.sh` on every instance through cloud-init.
 
 The bootstrap script is embedded into the binary at build time (`//go:embed
 install.sh`), so the tool stays self-contained — there is nothing to copy onto
@@ -43,9 +44,11 @@ Each instance receives cloud-init user-data that, in order:
 
 1. updates and upgrades all apt packages,
 2. writes the embedded `install.sh` plus a root-only env file holding the
-   repository URL, that instance's registration token, and the runner name,
-3. runs `install.sh`, which installs Docker, kubectl, kind, and helm, and
-   registers the GitHub Actions runner as a systemd service,
+   repository URL, that instance's registration token, the runner name, and the
+   disk guard settings,
+3. runs `install.sh`, which installs Docker, kubectl, kind, and helm, registers
+   the GitHub Actions runner as a systemd service, and installs the
+   [disk guard](#keeping-the-disk-from-filling-up),
 4. reboots, so the upgraded kernel is active and the runner service comes up
    clean.
 
@@ -92,14 +95,78 @@ remove — and asks for confirmation before it changes anything (skip with `-yes
 Because existing shared infrastructure is reused as-is, flags that shape it
 (`-subnet-cidr`, `-dns`, `-external`) have **no effect** once the resource
 exists; the command warns when you pass one that cannot apply. Per-instance
-flags (`-flavor`, `-image`, `-volume-size`, `-volume-type`) apply only to the
-instances being created; instances already running are left untouched.
+flags (`-flavor`, `-image`, `-volume-size`, `-volume-type`, `-disk-guard-*`)
+apply only to the instances being created; instances already running are left
+untouched.
 
 > **Scaling down leaves the GitHub runner registered.** This tool manages cloud
 > resources only. When it deletes an instance, the corresponding self-hosted
 > runner stays registered with GitHub and simply shows as *offline*. Remove it
 > under *Settings → Actions → Runners*; the command prints a reminder naming the
 > instances it removed.
+
+## Keeping the disk from filling up
+
+A self-hosted runner fills its disk because nothing between two jobs removes
+what the previous one left behind: KinD clusters that outlived their job, every
+image pulled or built, the BuildKit cache, and the runner's own `_work` tree.
+GitHub's hosted runners sidestep this by throwing the whole VM away after every
+job; a persistent runner has to reclaim explicitly, and a KinD workload reaches
+a full `/var/lib/docker` within a few dozen jobs.
+
+Every instance therefore gets a **disk guard**, installed by `install.sh` and on
+by default. It works on three levels.
+
+**1. Bounded logs.** Container logs are the one thing `docker system prune`
+never reclaims — the log of a running container belongs to a container that
+still exists. `/etc/docker/daemon.json` caps them at 3 × 10 MiB per container,
+which matters most under KinD, where every node is a long-lived container
+logging kubelet and containerd chatter. The journal is capped the same way
+(`SystemMaxUse=500M`). An existing `daemon.json` is never rewritten — a broken
+one keeps `dockerd` from starting at all, which is worse than an uncapped log —
+so the script says it left yours alone.
+
+**2. Reclaim after every job.** The runner itself invokes the guard through its
+job hooks (`ACTIONS_RUNNER_HOOK_JOB_STARTED` / `_COMPLETED`, registered in the
+runner's `.env`). The post-job pass runs when the job's containers are garbage
+by definition, so it deletes every KinD cluster, exited containers, dangling
+images, and dangling build cache without ever racing a live workload. It keeps
+tagged images and the tool cache, so the next job stays fast. The pre-job pass
+normally only looks: if the instance is *already* at the threshold before the
+job starts, it reclaims first and warns in the job log — a job about to run out
+of disk says so at the top of its own log instead of failing obscurely halfway
+through. Neither hook can fail a job: both report what they did and exit zero.
+
+**3. Escalation at the threshold.** Once usage of the filesystem holding
+`/var/lib/docker` reaches `-disk-guard-threshold` (80% by default), the guard
+stops being gentle and also drops every unused image and volume, the whole build
+cache, the runner's `_actions`/`_tool` caches, and purgeable packages. The next
+job re-downloads them; that is the point where being slow beats being full.
+
+A systemd timer (`ogrm-disk-guard.timer`, firing every `-disk-guard-interval`,
+15m by default) is the safety net for jobs whose completed hook never ran — a
+cancelled job, a runner crash, a reboot — and for a disk that fills during one
+long job. While a job is in flight the timer only takes what cannot belong to
+that job (entries older than two hours, no cluster deletions); with the runner
+idle it does the full pass. Below the threshold it does nothing at all.
+
+On an instance:
+
+```shell
+sudo /opt/ogrm/disk-guard.sh report   # what the guard sees right now
+sudo /opt/ogrm/disk-guard.sh timer    # force a check instead of waiting
+journalctl -u ogrm-disk-guard         # what it has been reclaiming
+```
+
+`-no-disk-guard` skips all of it — no log caps, no hooks, no timer — for when
+you manage the runner's disk yourself. The guard runs as root (it vacuums the
+journal and the apt cache) and the hooks run as the runner user, so a sudoers
+drop-in lets that one user call exactly the one root-owned guard script.
+
+If the guard reclaims after every job and the disk *still* runs out, the
+workload needs more room than the volume has: raise `-volume-size` for the
+instances you create next. Existing instances keep the volume they were built
+with, so replacing them (or growing the fleet) is what changes it.
 
 ## Naming scheme
 
@@ -146,8 +213,10 @@ is part of the prefix those commands match on.
 ## Build
 
 ```shell
-make build        # -> bin/ogrm
-make test         # unit tests
+make build            # -> bin/ogrm
+make test             # every unit test (Go and the disk guard)
+make test-go          # only the Go tests
+make test-disk-guard  # only the disk guard's decision table
 make vet
 ```
 
@@ -210,6 +279,9 @@ Key flags (`create -h` for the full list):
 | `-volume-type`        | `ssd`                | Cinder volume type for the boot volume     |
 | `-labels`             | *(none)*             | extra runner labels, comma-separated       |
 | `-keep-volumes`       | `false`              | keep boot volumes when an instance is deleted |
+| `-no-disk-guard`      | `false`              | do not install the [disk guard](#keeping-the-disk-from-filling-up) on the new instances |
+| `-disk-guard-threshold` | `80`               | percent used at which the guard also discards image and tool caches |
+| `-disk-guard-interval`  | `15m`              | how often the guard's timer re-checks (the per-job hooks run regardless) |
 | `-availability-zone`  | *(cloud default)*    | AZ for volumes and instances               |
 | `-cloud`              | `OS_CLOUD`, else `openstack` | `clouds.yaml` entry to use          |
 | `-connect-timeout`    | `10s`                | per-attempt timeout for connecting to OpenStack |
@@ -270,7 +342,15 @@ The pure logic — the naming scheme, config validation, cloud-init rendering,
 the reconcile diff (`PlanReconcile`), the GitHub token minting (with a stubbed
 `gh`), and the prompt/flag handling — is covered by unit tests, and the create
 flow's decision logic (grow, shrink, gap-fill, replace-broken, no-op, auto-mint)
-is covered by an integration test that drives the command against a fake cloud:
+is covered by an integration test that drives the command against a fake cloud.
+
+The disk guard is shell, so it has its own test
+(`hack/test-disk-guard.sh`): it extracts the guard body out of `install.sh`,
+points it at a throw-away directory, and drives every subcommand with
+`docker`/`kind`/`journalctl`/`apt-get` stubbed out, asserting which reclaim
+steps run — and, just as importantly, which do not (no cluster deletions while a
+job is in flight; no cache purge in the pre-job hook). It needs neither root nor
+Docker, and runs as part of `make test`:
 
 ```shell
 make test

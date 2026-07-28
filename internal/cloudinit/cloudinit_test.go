@@ -7,16 +7,20 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/b42labs/openstack-github-runner-manager/internal/cloudinit"
 )
 
 func goodParams() cloudinit.Params {
 	return cloudinit.Params{
-		RepoURL:       "https://github.com/acme/example",
-		Token:         "TOKEN-A",
-		RunnerName:    "ogrm-acme-001",
-		InstallScript: []byte("#!/usr/bin/env bash\necho hi\n"),
+		RepoURL:            "https://github.com/acme/example",
+		Token:              "TOKEN-A",
+		RunnerName:         "ogrm-acme-001",
+		InstallScript:      []byte("#!/usr/bin/env bash\necho hi\n"),
+		DiskGuard:          true,
+		DiskGuardThreshold: 80,
+		DiskGuardInterval:  15 * time.Minute,
 	}
 }
 
@@ -101,6 +105,77 @@ func TestRenderEscapesSingleQuotesInSecrets(t *testing.T) {
 	// The classic '\'' idiom must appear so sourcing the file is safe.
 	if !strings.Contains(env, `RUNNER_TOKEN='tok'\''en'`) {
 		t.Errorf("single quote in token was not escaped, got:\n%s", env)
+	}
+}
+
+func TestRenderPassesDiskGuardSettings(t *testing.T) {
+	p := goodParams()
+	p.DiskGuardThreshold = 70
+	p.DiskGuardInterval = 20 * time.Minute
+	out, err := cloudinit.Render(p)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	env := extractEnv(t, string(out))
+	for _, want := range []string{
+		"DISK_GUARD_ENABLED='true'",
+		"DISK_GUARD_THRESHOLD='70'",
+		// Seconds, not Go's "20m0s": the value lands in OnUnitActiveSec.
+		"DISK_GUARD_INTERVAL='1200'",
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("env file missing line %q; env was:\n%s", want, env)
+		}
+	}
+}
+
+// A disabled guard must be stated explicitly, because install.sh defaults it
+// to on: an omitted variable would silently install the guard anyway.
+func TestRenderDisablesDiskGuardExplicitly(t *testing.T) {
+	p := goodParams()
+	p.DiskGuard = false
+	out, err := cloudinit.Render(p)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	env := extractEnv(t, string(out))
+	if !strings.Contains(env, "DISK_GUARD_ENABLED='false'") {
+		t.Errorf("env file must switch the guard off explicitly, got:\n%s", env)
+	}
+	if strings.Contains(env, "DISK_GUARD_THRESHOLD") || strings.Contains(env, "DISK_GUARD_INTERVAL") {
+		t.Errorf("a disabled guard needs no threshold or interval, got:\n%s", env)
+	}
+}
+
+// The knobs are validated here rather than on the instance, where install.sh
+// would reject them mid-boot with nobody watching.
+func TestRenderRejectsImpossibleDiskGuardSettings(t *testing.T) {
+	cases := map[string]func(*cloudinit.Params){
+		"threshold zero":     func(p *cloudinit.Params) { p.DiskGuardThreshold = 0 },
+		"threshold negative": func(p *cloudinit.Params) { p.DiskGuardThreshold = -1 },
+		"threshold full":     func(p *cloudinit.Params) { p.DiskGuardThreshold = 100 },
+		"interval too short": func(p *cloudinit.Params) { p.DiskGuardInterval = 30 * time.Second },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := goodParams()
+			mutate(&p)
+			if _, err := cloudinit.Render(p); err == nil {
+				t.Fatalf("Render accepted params with %s", name)
+			}
+		})
+	}
+}
+
+// With the guard off, its knobs are ignored rather than rejected — nothing on
+// the instance reads them.
+func TestRenderIgnoresDiskGuardSettingsWhenDisabled(t *testing.T) {
+	p := goodParams()
+	p.DiskGuard = false
+	p.DiskGuardThreshold = 0
+	p.DiskGuardInterval = 0
+	if _, err := cloudinit.Render(p); err != nil {
+		t.Fatalf("Render: %v", err)
 	}
 }
 

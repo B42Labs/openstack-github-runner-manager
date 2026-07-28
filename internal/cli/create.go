@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/b42labs/openstack-github-runner-manager/internal/cloudinit"
 	"github.com/b42labs/openstack-github-runner-manager/internal/config"
@@ -48,7 +49,14 @@ type createFlags struct {
 	volumeType  string
 	keepVolumes bool
 	assumeYes   bool
-	connect     connectSettings
+
+	// The disk guard is on by default, so the flag that turns it off is the
+	// negative one — same shape as -keep-volumes.
+	noDiskGuard        bool
+	diskGuardThreshold int
+	diskGuardInterval  time.Duration
+
+	connect connectSettings
 }
 
 // parseCreateFlags binds and parses the create command's flags. It is a
@@ -75,6 +83,9 @@ func parseCreateFlags(args []string, out io.Writer) (*createFlags, error) {
 	fs.IntVar(&f.volumeSize, "volume-size", config.DefaultVolumeSize, "boot volume size in GiB")
 	fs.StringVar(&f.volumeType, "volume-type", config.DefaultVolumeType, "Cinder volume type for the boot volume")
 	fs.BoolVar(&f.keepVolumes, "keep-volumes", false, "keep boot volumes when an instance is deleted (default: delete with the instance)")
+	fs.BoolVar(&f.noDiskGuard, "no-disk-guard", false, "do not install the on-instance disk guard (leftover KinD clusters and Docker layers are then never reclaimed)")
+	fs.IntVar(&f.diskGuardThreshold, "disk-guard-threshold", config.DefaultDiskGuardThreshold, "filesystem usage in percent at or above which the disk guard also discards image and tool caches")
+	fs.DurationVar(&f.diskGuardInterval, "disk-guard-interval", config.DefaultDiskGuardInterval, "how often the disk guard's timer re-checks the filesystem (the per-job hooks run regardless)")
 	fs.BoolVar(&f.assumeYes, "yes", false, "do not prompt for confirmation before changing resources")
 	bindConnectFlags(fs, &f.connect)
 
@@ -155,6 +166,9 @@ func configFromFlags(f *createFlags) config.Config {
 		Labels:                     f.labels,
 		KeyOutPath:                 f.keyOut,
 		DeleteVolumesOnTermination: !f.keepVolumes,
+		DiskGuard:                  !f.noDiskGuard,
+		DiskGuardThreshold:         f.diskGuardThreshold,
+		DiskGuardInterval:          f.diskGuardInterval,
 	}
 }
 
@@ -200,11 +214,14 @@ func createWith(ctx context.Context, f *createFlags, cfg config.Config, names na
 		}
 		for k, idx := range plan.InstancesToCreate {
 			ud, err := cloudinit.Render(cloudinit.Params{
-				RepoURL:       repo,
-				Token:         tokens[k],
-				RunnerName:    names.Server(idx),
-				Labels:        cfg.Labels,
-				InstallScript: env.InstallScript,
+				RepoURL:            repo,
+				Token:              tokens[k],
+				RunnerName:         names.Server(idx),
+				Labels:             cfg.Labels,
+				InstallScript:      env.InstallScript,
+				DiskGuard:          cfg.DiskGuard,
+				DiskGuardThreshold: cfg.DiskGuardThreshold,
+				DiskGuardInterval:  cfg.DiskGuardInterval,
 			})
 			if err != nil {
 				return fmt.Errorf("render user-data for %s: %w", names.Server(idx), err)
@@ -253,6 +270,7 @@ func printReconcilePlan(out io.Writer, names naming.Scheme, cfg config.Config, p
 	if len(plan.InstancesToCreate) > 0 {
 		fmt.Fprintf(out, "  Add          : %s\n", joinServerNames(names, plan.InstancesToCreate))
 		fmt.Fprintf(out, "                 (flavor %s, boot volume %d GiB type %s from image %q)\n", cfg.Flavor, cfg.VolumeSize, cfg.VolumeType, cfg.Image)
+		fmt.Fprintf(out, "                 (disk guard %s)\n", diskGuardSummary(cfg))
 	} else {
 		fmt.Fprintln(out, "  Add          : none")
 	}
@@ -287,9 +305,20 @@ func reuseWarnings(cfg config.Config, plan openstack.ReconcilePlan) []string {
 		warnings = append(warnings, fmt.Sprintf("router already exists; -external %s is ignored (its gateway is fixed at creation)", cfg.ExternalNet))
 	}
 	if !plan.NeedNetwork && len(plan.InstancesToCreate) > 0 {
-		warnings = append(warnings, "-flavor/-image/-volume-* apply only to the new instances; existing instances are left unchanged")
+		warnings = append(warnings, "-flavor/-image/-volume-*/-disk-guard-* apply only to the new instances; existing instances are left unchanged")
 	}
 	return warnings
+}
+
+// diskGuardSummary renders the guard's configuration for the plan, in the terms
+// an operator reasons about: when it starts discarding caches, and how often it
+// looks. The per-job hooks are unconditional, so they are stated as such.
+func diskGuardSummary(cfg config.Config) string {
+	if !cfg.DiskGuard {
+		return "off - nothing reclaims leftover KinD clusters or Docker layers"
+	}
+	return fmt.Sprintf("on - reclaims after every job, discards caches at %d%% used, timer every %s",
+		cfg.DiskGuardThreshold, cfg.DiskGuardInterval)
 }
 
 // printReconcileSummary closes out a successful reconcile: it reports the new

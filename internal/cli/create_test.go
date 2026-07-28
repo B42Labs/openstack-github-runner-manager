@@ -6,6 +6,7 @@ package cli
 import (
 	"io"
 	"testing"
+	"time"
 
 	"github.com/b42labs/openstack-github-runner-manager/internal/config"
 )
@@ -42,6 +43,51 @@ func TestParseCreateFlagsDefaults(t *testing.T) {
 	// keep-volumes defaults to false, which means delete-on-termination is on.
 	if f.keepVolumes {
 		t.Errorf("keep-volumes should default to false")
+	}
+	// Likewise no-disk-guard defaults to false, which means the guard is on.
+	if f.noDiskGuard {
+		t.Errorf("no-disk-guard should default to false, so the guard is installed")
+	}
+	if f.diskGuardThreshold != config.DefaultDiskGuardThreshold {
+		t.Errorf("disk-guard-threshold default = %d; want %d", f.diskGuardThreshold, config.DefaultDiskGuardThreshold)
+	}
+	if f.diskGuardInterval != config.DefaultDiskGuardInterval {
+		t.Errorf("disk-guard-interval default = %s; want %s", f.diskGuardInterval, config.DefaultDiskGuardInterval)
+	}
+}
+
+// The guard's flags must survive the flag -> Config -> cloud-init hand-off,
+// since that is the only path by which they reach the instance.
+func TestConfigFromFlagsCarriesDiskGuard(t *testing.T) {
+	f, err := parseCreateFlags([]string{
+		"-name", "acme",
+		"-disk-guard-threshold", "65",
+		"-disk-guard-interval", "5m",
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cfg := configFromFlags(f)
+	cfg.ApplyDefaults()
+	if !cfg.DiskGuard {
+		t.Errorf("DiskGuard = false; want true without -no-disk-guard")
+	}
+	if cfg.DiskGuardThreshold != 65 {
+		t.Errorf("DiskGuardThreshold = %d; want 65", cfg.DiskGuardThreshold)
+	}
+	if cfg.DiskGuardInterval != 5*time.Minute {
+		t.Errorf("DiskGuardInterval = %s; want 5m", cfg.DiskGuardInterval)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() rejected the parsed flags: %v", err)
+	}
+
+	off, err := parseCreateFlags([]string{"-name", "acme", "-no-disk-guard"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if configFromFlags(off).DiskGuard {
+		t.Errorf("-no-disk-guard must switch the guard off")
 	}
 }
 

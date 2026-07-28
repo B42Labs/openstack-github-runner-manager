@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/b42labs/openstack-github-runner-manager/internal/naming"
 )
@@ -29,6 +30,24 @@ const (
 	DefaultVolumeSize  = 100 // GiB
 	DefaultVolumeType  = "ssd"
 	DefaultCount       = 1
+)
+
+// Disk guard defaults. A KinD runner's boot volume fills from leftover
+// clusters, images, and build cache, so every instance gets an on-instance
+// guard that reclaims between jobs (see install.sh section 9).
+//
+// The threshold is where the guard stops being gentle and starts throwing away
+// caches the next job would have reused: 80% of a 100 GiB volume still leaves
+// ~20 GiB, which is more than a KinD-plus-images job typically needs, so the
+// expensive pass stays rare. The interval only paces the safety-net timer —
+// the hooks reclaim after every job regardless — so it can be coarse.
+const (
+	DefaultDiskGuardThreshold = 80
+	DefaultDiskGuardInterval  = 15 * time.Minute
+
+	// minDiskGuardInterval keeps the timer from running so often that the
+	// checks themselves become the load on the instance.
+	minDiskGuardInterval = time.Minute
 )
 
 // DefaultDNSNameservers are injected into the subnet so freshly booted
@@ -91,6 +110,24 @@ type Config struct {
 	// orphaned volume behind; the teardown path sweeps any stragglers
 	// regardless.
 	DeleteVolumesOnTermination bool
+
+	// DiskGuard installs the on-instance disk guard: capped container and
+	// journal logs, a reclaim pass hooked into every job, and a timer as the
+	// safety net. Like DeleteVolumesOnTermination it is an opt-out the CLI
+	// sets explicitly, since a false default cannot be expressed through
+	// ApplyDefaults.
+	DiskGuard bool
+
+	// DiskGuardThreshold is the filesystem usage in percent (1..99) at or
+	// above which the guard also discards what the next job would have
+	// reused: every unused image, the build cache, and the runner's action
+	// and tool caches.
+	DiskGuardThreshold int
+
+	// DiskGuardInterval is how often the guard's systemd timer re-checks the
+	// filesystem. It is the safety net for jobs that never ran their
+	// completed hook, and for a disk filling during one long job.
+	DiskGuardInterval time.Duration
 }
 
 // ApplyDefaults fills any unset field with its default. It is idempotent and
@@ -122,6 +159,12 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.VolumeType == "" {
 		c.VolumeType = DefaultVolumeType
+	}
+	if c.DiskGuardThreshold == 0 {
+		c.DiskGuardThreshold = DefaultDiskGuardThreshold
+	}
+	if c.DiskGuardInterval == 0 {
+		c.DiskGuardInterval = DefaultDiskGuardInterval
 	}
 }
 
@@ -174,6 +217,16 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(c.ExternalNet) == "" {
 		return fmt.Errorf("external network is required")
+	}
+	// The guard's knobs are only meaningful when it is installed at all; with
+	// it switched off they are ignored rather than rejected.
+	if c.DiskGuard {
+		if c.DiskGuardThreshold < 1 || c.DiskGuardThreshold > 99 {
+			return fmt.Errorf("disk guard threshold %d%% out of range (must be 1..99)", c.DiskGuardThreshold)
+		}
+		if c.DiskGuardInterval < minDiskGuardInterval {
+			return fmt.Errorf("disk guard interval %s is too short (must be >= %s)", c.DiskGuardInterval, minDiskGuardInterval)
+		}
 	}
 	return nil
 }

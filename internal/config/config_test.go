@@ -6,6 +6,7 @@ package config_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/b42labs/openstack-github-runner-manager/internal/config"
 )
@@ -56,6 +57,12 @@ func TestApplyDefaults(t *testing.T) {
 	}
 	if len(c.DNSNameservers) == 0 {
 		t.Errorf("DNSNameservers should default to a non-empty list")
+	}
+	if c.DiskGuardThreshold != config.DefaultDiskGuardThreshold {
+		t.Errorf("DiskGuardThreshold = %d; want %d", c.DiskGuardThreshold, config.DefaultDiskGuardThreshold)
+	}
+	if c.DiskGuardInterval != config.DefaultDiskGuardInterval {
+		t.Errorf("DiskGuardInterval = %s; want %s", c.DiskGuardInterval, config.DefaultDiskGuardInterval)
 	}
 }
 
@@ -110,6 +117,9 @@ func TestValidateRejects(t *testing.T) {
 		{"uppercase fleet", func(c *config.Config) { c.Fleet = "GHA" }, "fleet prefix"},
 		{"underscore fleet", func(c *config.Config) { c.Fleet = "g_a" }, "fleet prefix"},
 		{"fleet plus project too long", func(c *config.Config) { c.Fleet = strings.Repeat("a", 60) }, "too long"},
+		{"guard threshold zero", func(c *config.Config) { c.DiskGuard = true; c.DiskGuardThreshold = 0 }, "out of range"},
+		{"guard threshold full", func(c *config.Config) { c.DiskGuard = true; c.DiskGuardThreshold = 100 }, "out of range"},
+		{"guard interval too short", func(c *config.Config) { c.DiskGuard = true; c.DiskGuardInterval = time.Second }, "too short"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -123,6 +133,20 @@ func TestValidateRejects(t *testing.T) {
 				t.Errorf("Validate() error = %q; want substring %q", err.Error(), tc.wantSub)
 			}
 		})
+	}
+}
+
+// TestValidateIgnoresDiskGuardSettingsWhenGuardIsOff documents that the guard's
+// knobs are only checked when the guard is installed: with -no-disk-guard
+// nothing on the instance reads them, so a nonsensical value is ignored rather
+// than blocking a create.
+func TestValidateIgnoresDiskGuardSettingsWhenGuardIsOff(t *testing.T) {
+	c := validConfig()
+	c.DiskGuard = false
+	c.DiskGuardThreshold = 0
+	c.DiskGuardInterval = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate() rejected ignored disk guard settings: %v", err)
 	}
 }
 
