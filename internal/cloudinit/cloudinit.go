@@ -9,7 +9,8 @@
 //
 //  1. updates and upgrades every apt package (package_update / package_upgrade),
 //  2. writes the embedded install.sh and a root-only env file holding the
-//     repository URL, the registration token, and the runner name,
+//     repository URL, the registration token, the runner name, and the disk
+//     guard settings,
 //  3. runs install.sh with those values exported (runcmd), and
 //  4. reboots the instance so the upgraded kernel and the freshly installed
 //     runner service come up clean (power_state).
@@ -22,7 +23,9 @@ package cloudinit
 import (
 	"encoding/base64"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // scriptPath and envPath are where the document drops the installer and its
@@ -41,6 +44,14 @@ type Params struct {
 	RunnerName    string
 	Labels        string // optional; empty falls back to install.sh's own default
 	InstallScript []byte
+
+	// DiskGuard turns install.sh's disk guard on: capped container and journal
+	// logs, a reclaim pass hooked into every job, and a timer as the safety
+	// net. Threshold (percent used) and Interval shape it and are only read
+	// when DiskGuard is true.
+	DiskGuard          bool
+	DiskGuardThreshold int
+	DiskGuardInterval  time.Duration
 }
 
 // Render returns the user-data document for one instance. It returns an
@@ -58,6 +69,16 @@ func Render(p Params) ([]byte, error) {
 	}
 	if len(p.InstallScript) == 0 {
 		return nil, fmt.Errorf("cloudinit: install script is empty")
+	}
+	// install.sh rejects an out-of-range value too, but there it fails on the
+	// instance, mid-boot, where nobody is watching. Catch it here instead.
+	if p.DiskGuard {
+		if p.DiskGuardThreshold < 1 || p.DiskGuardThreshold > 99 {
+			return nil, fmt.Errorf("cloudinit: disk guard threshold %d%% out of range (must be 1..99)", p.DiskGuardThreshold)
+		}
+		if p.DiskGuardInterval < time.Minute {
+			return nil, fmt.Errorf("cloudinit: disk guard interval %s is too short (must be >= 1m)", p.DiskGuardInterval)
+		}
 	}
 
 	scriptB64 := base64.StdEncoding.EncodeToString(p.InstallScript)
@@ -98,6 +119,15 @@ func renderEnv(p Params) string {
 	b.WriteString("RUNNER_NAME=" + shellSingleQuote(p.RunnerName) + "\n")
 	if p.Labels != "" {
 		b.WriteString("RUNNER_LABELS=" + shellSingleQuote(p.Labels) + "\n")
+	}
+	// Always written, in both states: install.sh defaults the guard to on, so
+	// an omitted variable and a disabled guard would look the same.
+	b.WriteString("DISK_GUARD_ENABLED=" + shellSingleQuote(strconv.FormatBool(p.DiskGuard)) + "\n")
+	if p.DiskGuard {
+		b.WriteString("DISK_GUARD_THRESHOLD=" + shellSingleQuote(strconv.Itoa(p.DiskGuardThreshold)) + "\n")
+		// Seconds, because the value lands in the timer's OnUnitActiveSec,
+		// where a bare integer is unambiguously seconds — unlike Go's "15m0s".
+		b.WriteString("DISK_GUARD_INTERVAL=" + shellSingleQuote(strconv.Itoa(int(p.DiskGuardInterval.Seconds()))) + "\n")
 	}
 	return b.String()
 }

@@ -6,12 +6,14 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/b42labs/openstack-github-runner-manager/internal/cloudinit"
+	"github.com/b42labs/openstack-github-runner-manager/internal/config"
 	"github.com/b42labs/openstack-github-runner-manager/internal/naming"
 	"github.com/b42labs/openstack-github-runner-manager/internal/openstack"
 )
@@ -108,8 +110,18 @@ func mustNotMint(t *testing.T) mintFunc {
 
 const itRepo = "https://github.com/acme/example"
 
+// baseFlags mirrors what parseCreateFlags hands back for a minimal command
+// line, defaults included, so the flow under test sees the same values a real
+// invocation would.
 func baseFlags() *createFlags {
-	return &createFlags{name: "acme", prefix: "ogrm", repo: itRepo, assumeYes: true}
+	return &createFlags{
+		name:               "acme",
+		prefix:             "ogrm",
+		repo:               itRepo,
+		assumeYes:          true,
+		diskGuardThreshold: config.DefaultDiskGuardThreshold,
+		diskGuardInterval:  config.DefaultDiskGuardInterval,
+	}
 }
 
 func TestCreateFreshProvisionsAllInstances(t *testing.T) {
@@ -304,6 +316,65 @@ func TestCreateSurfacesMintFailure(t *testing.T) {
 	}
 }
 
+// TestCreatePlanStatesDiskGuard covers what the operator confirms: the guard
+// shapes how the new instances behave for their whole life, so the plan has to
+// say which way it was set — and the setting has to reach the user-data.
+func TestCreatePlanStatesDiskGuard(t *testing.T) {
+	t.Run("on by default", func(t *testing.T) {
+		f := baseFlags()
+		f.count = 1
+		f.tokens = multiString{"tok-1"}
+		fake := &fakeReconciler{listFleet: &openstack.Fleet{}}
+
+		out := runCreateWith(t, f, fake, "", mustNotMint(t))
+
+		if !strings.Contains(out, "disk guard on") {
+			t.Errorf("plan does not state that the disk guard is on:\n%s", out)
+		}
+		assertUserData(t, fake.gotSpec, f, map[int]string{1: "tok-1"})
+	})
+
+	t.Run("off with -no-disk-guard", func(t *testing.T) {
+		f := baseFlags()
+		f.count = 1
+		f.tokens = multiString{"tok-1"}
+		f.noDiskGuard = true
+		fake := &fakeReconciler{listFleet: &openstack.Fleet{}}
+
+		out := runCreateWith(t, f, fake, "", mustNotMint(t))
+
+		if !strings.Contains(out, "disk guard off") {
+			t.Errorf("plan does not state that the disk guard is off:\n%s", out)
+		}
+		assertUserData(t, fake.gotSpec, f, map[int]string{1: "tok-1"})
+		// And spell out what the instance actually receives: the plan line and
+		// the user-data must not be able to drift apart.
+		if env := envFromUserData(t, fake.gotSpec.UserData[1]); !strings.Contains(env, "DISK_GUARD_ENABLED='false'") {
+			t.Errorf("user-data does not switch the guard off; env was:\n%s", env)
+		}
+	})
+}
+
+// envFromUserData decodes the env file out of a rendered document. The
+// renderer writes install.sh first and the env file second, both base64.
+func envFromUserData(t *testing.T, doc []byte) string {
+	t.Helper()
+	var blobs []string
+	for _, line := range strings.Split(string(doc), "\n") {
+		if after, ok := strings.CutPrefix(strings.TrimSpace(line), "content: "); ok {
+			blobs = append(blobs, after)
+		}
+	}
+	if len(blobs) != 2 {
+		t.Fatalf("expected two base64 content blocks in the user-data, found %d", len(blobs))
+	}
+	raw, err := base64.StdEncoding.DecodeString(blobs[1])
+	if err != nil {
+		t.Fatalf("decode env block: %v", err)
+	}
+	return string(raw)
+}
+
 // assertUserData checks that each created instance's rendered cloud-init equals
 // what Render produces for that instance's own token — proving the token→index
 // mapping is correct end to end.
@@ -319,11 +390,14 @@ func assertUserData(t *testing.T, spec openstack.Spec, f *createFlags, tokenByIn
 			continue
 		}
 		want, err := cloudinit.Render(cloudinit.Params{
-			RepoURL:       itRepo,
-			Token:         token,
-			RunnerName:    itNames.Server(idx),
-			Labels:        f.labels,
-			InstallScript: []byte("#!/bin/bash\necho install\n"),
+			RepoURL:            itRepo,
+			Token:              token,
+			RunnerName:         itNames.Server(idx),
+			Labels:             f.labels,
+			InstallScript:      []byte("#!/bin/bash\necho install\n"),
+			DiskGuard:          !f.noDiskGuard,
+			DiskGuardThreshold: f.diskGuardThreshold,
+			DiskGuardInterval:  f.diskGuardInterval,
 		})
 		if err != nil {
 			t.Fatalf("render expected user-data: %v", err)

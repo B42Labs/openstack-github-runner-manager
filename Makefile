@@ -22,18 +22,23 @@ COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)
 
-.PHONY: help build test vet lint tidy fmt run clean
+.PHONY: help build test test-go test-disk-guard vet lint tidy fmt run clean
 
 help: ## Print this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| sort \
-		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-8s\033[0m %s\n",$$1,$$2}'
+		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n",$$1,$$2}'
 
 build: ## Build the ogrm binary into bin/
 	go build -ldflags "$(LDFLAGS)" -o $(BIN) .
 
-test: ## Run the unit tests
+test: test-go test-disk-guard ## Run every unit test (Go and the disk guard)
+
+test-go: ## Run the Go unit tests
 	go test ./...
+
+test-disk-guard: ## Exercise the disk guard install.sh generates (no root, no Docker)
+	./hack/test-disk-guard.sh
 
 vet: ## Run go vet
 	go vet ./...
