@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright 2026 B42Labs contributors
+# SPDX-License-Identifier: BUSL-1.1
+
+# Build output.
+/bin/
+
+# Generated SSH private keys (ogrm-<xxx>-key.pem). These are emitted by
+# `create` and must never be committed.
+*.pem
+
+# OpenStack credentials. clouds.yaml / secure.yaml hold the auth secrets the
+# tool reads via OS_CLOUD; keep them out of the repository.
+clouds.yaml
+secure.yaml
+
+# Local Claude Code settings.
+.claude/
