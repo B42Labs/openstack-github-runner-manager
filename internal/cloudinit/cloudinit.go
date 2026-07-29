@@ -45,10 +45,10 @@ type Params struct {
 	Labels        string // optional; empty falls back to install.sh's own default
 	InstallScript []byte
 
-	// DiskGuard turns install.sh's disk guard on: capped container and journal
-	// logs, a reclaim pass hooked into every job, and a timer as the safety
-	// net. Threshold (percent used) and Interval shape it and are only read
-	// when DiskGuard is true.
+	// DiskGuard turns install.sh's disk guard on: a capped journal, a reclaim
+	// pass hooked into every job, and a timer as the safety net. Threshold
+	// (percent used) and Interval shape it and are only read when DiskGuard
+	// is true.
 	DiskGuard          bool
 	DiskGuardThreshold int
 	DiskGuardInterval  time.Duration

@@ -70,7 +70,7 @@ therefore provisions:
 
 | Group | What | Why it is not left to the workflow |
 | --- | --- | --- |
-| Container runtime | Docker CE from `download.docker.com` (engine, CLI, containerd, buildx, compose) | The Ubuntu `docker.io` package lags and omits buildx |
+| Container runtime | Docker CE from `download.docker.com` (engine, CLI, containerd, buildx, compose), held on the classic image store | The Ubuntu `docker.io` package lags and omits buildx. Engine 29 defaults to the containerd image store, where `docker save` exports an image's whole manifest index — and `kind load docker-image`, which imports it with `--all-platforms`, then fails on every multi-arch image over the platforms this host never pulled |
 | Kubernetes | `kubectl`, `kind`, `helm` (latest release each) | KinD-based e2e suites shell out to all three; `helm` in particular is rarely installed by an action |
 | YAML | `yq` — the **mikefarah/yq** Go binary, *not* the `yq` apt package | Workflows use v4 syntax (`yq eval`, `yq -i`, `yq 'keys \| .[]'`). The apt package is kislyuk/yq, a jq wrapper that would misparse those expressions instead of failing cleanly |
 | Build | `build-essential`, `make`, `jq`, `curl`, `tar`, `gnupg` | `go test -race` and any cgo build need a C toolchain |
@@ -152,10 +152,12 @@ by default. It works on three levels.
 never reclaims — the log of a running container belongs to a container that
 still exists. `/etc/docker/daemon.json` caps them at 3 × 10 MiB per container,
 which matters most under KinD, where every node is a long-lived container
-logging kubelet and containerd chatter. The journal is capped the same way
-(`SystemMaxUse=500M`). An existing `daemon.json` is never rewritten — a broken
-one keeps `dockerd` from starting at all, which is worse than an uncapped log —
-so the script says it left yours alone.
+logging kubelet and containerd chatter. That cap is written with the rest of the
+Docker daemon config, so it holds even with the guard off; the journal is capped
+the same way (`SystemMaxUse=500M`), and that one is the guard's. An existing
+`daemon.json` is never rewritten — a broken one keeps `dockerd` from starting at
+all, which is worse than an uncapped log — so the script says it left yours
+alone.
 
 **2. Reclaim after every job.** The runner itself invokes the guard through its
 job hooks (`ACTIONS_RUNNER_HOOK_JOB_STARTED` / `_COMPLETED`, registered in the
