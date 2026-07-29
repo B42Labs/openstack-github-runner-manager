@@ -162,7 +162,53 @@ apt-get install -y \
   docker-ce docker-ce-cli containerd.io \
   docker-buildx-plugin docker-compose-plugin
 
-systemctl enable --now docker
+# Docker Engine 29 makes the containerd image store the default on a fresh
+# install, and there `docker save` exports an image's whole manifest index -
+# including the platforms this host never pulled. `kind load docker-image`
+# pipes that into `ctr images import --all-platforms`, which then dies on the
+# first foreign manifest of every multi-arch image a job loads:
+#
+#   ctr: content digest sha256:<the arm64 manifest>: not found
+#
+# A runner meant to stand in for a GitHub-hosted one therefore stays on the
+# classic image store, where `docker save` exports the one platform that is
+# actually here.
+#
+# The log caps ride along in the same file: dockerd reads a single config, so
+# writing it once here saves a second restart later. They matter most under
+# KinD - container logs are the one thing `docker system prune` can never
+# reclaim, because the log of a running container belongs to a container that
+# still exists, and every KinD node is a long-lived container logging kubelet
+# and containerd chatter.
+if [[ -f /etc/docker/daemon.json ]]; then
+  # Never merge into an operator's own daemon config: a broken daemon.json
+  # keeps dockerd from starting at all, which is worse than either default.
+  echo "    /etc/docker/daemon.json already exists; leaving it untouched."
+  if ! jq -e '.features."containerd-snapshotter" == false' /etc/docker/daemon.json >/dev/null 2>&1; then
+    echo "    WARNING: it does not set features.containerd-snapshotter to false."
+    echo "    WARNING: 'kind load docker-image' then fails on every multi-arch image."
+  fi
+  echo "    Ensure it sets log-opts max-size/max-file, or container logs stay unbounded."
+else
+  install -d -m 0755 /etc/docker
+  cat > /etc/docker/daemon.json <<'JSON'
+{
+  "features": {
+    "containerd-snapshotter": false
+  },
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+JSON
+fi
+
+# apt has already started dockerd, without the config above - so restart it
+# rather than start it, and enable it for the reboot cloud-init does at the end.
+systemctl enable docker
+systemctl restart docker
 
 # Add the user to the docker group
 usermod -aG docker "${RUNNER_USER}"
@@ -278,36 +324,14 @@ for mod in "${CHAOS_MODULES[@]}"; do
     || echo "    WARNING: modprobe ${mod} failed; NetworkChaos suites may fail."
 done
 
-# --- 8) Cap the log growth ----------------------------------------------------
+# --- 8) Cap the journal growth ------------------------------------------------
 # A long-lived runner fills its disk from three directions: container logs that
 # grow without any bound, the systemd journal, and the Docker/KinD state a job
-# leaves behind. The first two are bounded here once and for all; the third is
-# what the disk guard in section 10 reclaims.
-#
-# The log cap matters most for KinD: every node is a container that logs
-# kubelet/containerd chatter for the life of the cluster, and `docker system
-# prune` never touches the log of a container that still exists.
+# leaves behind. The first is capped with the rest of the daemon config in
+# section 2, because dockerd has only one config file to write; the journal is
+# bounded here; the third is what the disk guard in section 10 reclaims.
 if [[ "${DISK_GUARD_ENABLED}" == "true" ]]; then
-  echo "==> Capping container and journal log growth ..."
-
-  if [[ -f /etc/docker/daemon.json ]]; then
-    # Never merge into an operator's own daemon config: a broken daemon.json
-    # keeps dockerd from starting at all, which is worse than an uncapped log.
-    echo "    /etc/docker/daemon.json already exists; leaving it untouched."
-    echo "    Ensure it sets log-opts max-size/max-file, or container logs stay unbounded."
-  else
-    install -d -m 0755 /etc/docker
-    cat > /etc/docker/daemon.json <<'JSON'
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  }
-}
-JSON
-    systemctl restart docker
-  fi
+  echo "==> Capping journal growth ..."
 
   install -d -m 0755 /etc/systemd/journald.conf.d
   cat > /etc/systemd/journald.conf.d/99-ogrm.conf <<'CONF'
