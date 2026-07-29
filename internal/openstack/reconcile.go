@@ -17,6 +17,8 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/routers"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/networks"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/subnets"
+
+	"github.com/b42labs/openstack-github-runner-manager/internal/labels"
 )
 
 // volumeReadyTimeout bounds how long a boot volume may take to leave the
@@ -128,6 +130,8 @@ func (m *Manager) Reconcile(ctx context.Context, current *Fleet, plan ReconcileP
 // keypair present, creating only what the plan reports missing and reusing the
 // rest by the IDs discovered in current. It records the resolved IDs on fleet.
 func (m *Manager) ensureInfra(ctx context.Context, current *Fleet, plan ReconcilePlan, spec Spec, fleet *Fleet) error {
+	fleetName, cluster := spec.Names.Fleet, spec.Names.Project
+
 	// 1) Private network.
 	if plan.NeedNetwork {
 		m.logf("Creating network %s ...", spec.Names.Network())
@@ -136,6 +140,9 @@ func (m *Manager) ensureInfra(ctx context.Context, current *Fleet, plan Reconcil
 			return fmt.Errorf("create network: %w", err)
 		}
 		fleet.NetworkID = network.ID
+		if err := m.C.tagNeutronResource(ctx, tagCollectionNetworks, network.ID, labels.For(fleetName, cluster, labels.RoleNetwork)); err != nil {
+			return err
+		}
 	} else {
 		m.logf("Reusing existing network %s.", spec.Names.Network())
 		fleet.NetworkID = current.NetworkID
@@ -158,6 +165,9 @@ func (m *Manager) ensureInfra(ctx context.Context, current *Fleet, plan Reconcil
 			return fmt.Errorf("create subnet: %w", err)
 		}
 		fleet.SubnetID = subnet.ID
+		if err := m.C.tagNeutronResource(ctx, tagCollectionSubnets, subnet.ID, labels.For(fleetName, cluster, labels.RoleSubnet)); err != nil {
+			return err
+		}
 	} else {
 		m.logf("Reusing existing subnet %s.", spec.Names.Subnet())
 		fleet.SubnetID = current.SubnetID
@@ -180,6 +190,9 @@ func (m *Manager) ensureInfra(ctx context.Context, current *Fleet, plan Reconcil
 			return fmt.Errorf("create router: %w", err)
 		}
 		fleet.RouterID = router.ID
+		if err := m.C.tagNeutronResource(ctx, tagCollectionRouters, router.ID, labels.For(fleetName, cluster, labels.RoleRouter)); err != nil {
+			return err
+		}
 	} else {
 		m.logf("Reusing existing router %s.", spec.Names.Router())
 		fleet.RouterID = current.RouterID
@@ -260,6 +273,9 @@ func (m *Manager) createInstances(ctx context.Context, plan ReconcilePlan, spec 
 			AvailabilityZone: spec.AvailabilityZone,
 			Networks:         []servers.Network{{UUID: fleet.NetworkID}},
 			UserData:         userData,
+			// Tags travel in the create call, so an instance is never visible
+			// untagged. This is what the compute client's 2.52 microversion buys.
+			Tags: labels.ForIndex(spec.Names.Fleet, spec.Names.Project, labels.RoleServer, idx).Tags(),
 			BlockDevice: []servers.BlockDevice{{
 				BootIndex:           0,
 				UUID:                volID,
@@ -308,6 +324,9 @@ func (m *Manager) ensureBootVolume(ctx context.Context, plan ReconcilePlan, spec
 		ImageID:          imageID,
 		VolumeType:       spec.VolumeType,
 		AvailabilityZone: spec.AvailabilityZone,
+		// Cinder takes the labels as volume metadata in the create call, so a
+		// boot volume is never visible unlabelled.
+		Metadata: labels.ForIndex(spec.Names.Fleet, spec.Names.Project, labels.RoleVolume, idx).Map(),
 	}, nil).Extract()
 	if err != nil {
 		return "", fmt.Errorf("create volume %s: %w", volName, err)

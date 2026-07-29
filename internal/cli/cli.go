@@ -84,7 +84,8 @@ Usage:
 Commands:
   create    Create the network, router, keypair, volumes, and instances,
             then bootstrap each instance into a runner via cloud-init.
-  list      Show the resources owned by a deployment (by name prefix).
+  list      Show the resources owned by a deployment, or every deployment
+            in the project with -all.
   delete    Delete every resource owned by a deployment.
   version   Print version information.
   help      Show this help.

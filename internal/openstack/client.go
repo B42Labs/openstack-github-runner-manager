@@ -11,9 +11,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/apiversions"
 	"github.com/gophercloud/utils/v2/openstack/clientconfig"
 )
 
@@ -25,6 +28,17 @@ const (
 	DefaultConnectTimeout  = 10 * time.Second
 	DefaultConnectAttempts = 3
 )
+
+// ComputeMicroversion is the nova API microversion every compute call is made
+// at. 2.52 is the first version that accepts a server's tags in the create call
+// itself, so an instance never exists untagged, and it implies the 2.26 needed
+// to filter a server listing by tag. It has been available since Queens (2018).
+//
+// DECISION: a cloud that cannot serve 2.52 fails at connection time rather than
+// falling back to server metadata (which needs no microversion but cannot be
+// filtered server-side). A fallback would keep a second discovery path alive
+// permanently, and every later change would have to be correct on both.
+const ComputeMicroversion = "2.52"
 
 // Clients bundles the four service clients a fleet needs. They are built
 // from the ambient OpenStack credentials (clouds.yaml selected by OS_CLOUD,
@@ -131,6 +145,15 @@ func connectOnce(ctx context.Context, cloudName string) (*Clients, error) {
 	if err != nil {
 		return nil, fmt.Errorf("compute client: %w", err)
 	}
+	// Confirm the microversion before pinning the client to it, so an
+	// unsupported cloud is reported by name here instead of surfacing as an
+	// opaque 406 on the first server create. The version document itself is
+	// read without the microversion header for the same reason.
+	if err := requireComputeMicroversion(ctx, compute, ComputeMicroversion); err != nil {
+		return nil, err
+	}
+	compute.Microversion = ComputeMicroversion
+
 	network, err := clientconfig.NewServiceClient(ctx, "network", opts)
 	if err != nil {
 		return nil, fmt.Errorf("network client: %w", err)
@@ -145,4 +168,67 @@ func connectOnce(ctx context.Context, cloudName string) (*Clients, error) {
 	}
 
 	return &Clients{Compute: compute, Network: network, Block: block, Image: image}, nil
+}
+
+// requireComputeMicroversion reads the compute service's version document and
+// reports whether it can serve the microversion the tool needs. The document is
+// unauthenticated metadata about the endpoint, so it costs one cheap round-trip
+// and answers the question before any resource is touched.
+func requireComputeMicroversion(ctx context.Context, compute *gophercloud.ServiceClient, want string) error {
+	v, err := apiversions.Get(ctx, compute, "v2.1").Extract()
+	if err != nil {
+		return fmt.Errorf("read the compute API version document to confirm nova microversion %s (required to tag instances): %w", want, err)
+	}
+	return microversionInRange(v.MinVersion, v.Version, want)
+}
+
+// microversionInRange checks want against the [min, max] window a compute
+// service advertises. It is split out from the HTTP call so the comparison is
+// unit-testable, and it compares the two components numerically: 2.100 is newer
+// than 2.52, which a string comparison gets backwards.
+func microversionInRange(min, max, want string) error {
+	wantMajor, wantMinor, err := parseMicroversion(want)
+	if err != nil {
+		return fmt.Errorf("requested nova microversion: %w", err)
+	}
+	if max == "" {
+		return fmt.Errorf("the compute service advertises no microversions, but nova microversion %s is required to tag instances at create", want)
+	}
+	maxMajor, maxMinor, err := parseMicroversion(max)
+	if err != nil {
+		return fmt.Errorf("compute service maximum microversion: %w", err)
+	}
+	if maxMajor < wantMajor || (maxMajor == wantMajor && maxMinor < wantMinor) {
+		return fmt.Errorf("the compute service supports nova microversions up to %s, but %s is required to tag instances at create; upgrade the cloud or use a project whose compute API is newer", max, want)
+	}
+	// A minimum past the requested version is vanishingly rare, but a cloud that
+	// advertises one rejects the header outright, so name it here rather than
+	// letting the first create fail with a 406.
+	if min != "" {
+		minMajor, minMinor, err := parseMicroversion(min)
+		if err != nil {
+			return fmt.Errorf("compute service minimum microversion: %w", err)
+		}
+		if minMajor > wantMajor || (minMajor == wantMajor && minMinor > wantMinor) {
+			return fmt.Errorf("the compute service requires nova microversion %s or newer, which is past the %s this tool requests", min, want)
+		}
+	}
+	return nil
+}
+
+// parseMicroversion splits a "major.minor" microversion into its two numbers.
+func parseMicroversion(v string) (major, minor int, err error) {
+	majorStr, minorStr, ok := strings.Cut(v, ".")
+	if !ok {
+		return 0, 0, fmt.Errorf("microversion %q is not in major.minor form", v)
+	}
+	major, err = strconv.Atoi(majorStr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("microversion %q has a non-numeric major version", v)
+	}
+	minor, err = strconv.Atoi(minorStr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("microversion %q has a non-numeric minor version", v)
+	}
+	return major, minor, nil
 }
