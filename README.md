@@ -201,9 +201,9 @@ with, so replacing them (or growing the fleet) is what changes it.
 
 ## Naming scheme
 
-Every resource shares the prefix `ogrm-<name>-`, which is how `delete` and `list`
-discover what a deployment owns. `<name>` is the value of `-name` — `acme`
-in the examples below.
+Every resource shares the prefix `ogrm-<name>-`, which together with the
+[labels](#labels) below is how `delete` and `list` discover what a deployment
+owns. `<name>` is the value of `-name` — `acme` in the examples below.
 
 | Resource              | Name                |
 | --------------------- | ------------------- |
@@ -220,6 +220,61 @@ per-instance instances and their boot volumes carry a zero-padded counter
 The leading `ogrm` token is configurable with `-prefix` (default `ogrm`). Pass
 the same `-prefix` to `list` and `delete` that you used for `create`, since it
 is part of the prefix those commands match on.
+
+## Labels
+
+Beyond its name, every resource `create` builds is stamped with four labels, so
+a resource can be traced back to its deployment without anyone parsing a name:
+
+| Label          | Value                                       |
+| -------------- | ------------------------------------------- |
+| `ogrm:fleet`   | the `-prefix` token, e.g. `ogrm`            |
+| `ogrm:cluster` | the `-name` token, e.g. `acme`              |
+| `ogrm:role`    | `network`, `subnet`, `router`, `server`, or `volume` |
+| `ogrm:index`   | the instance counter (`004`), on instances and boot volumes only |
+
+The key namespace is always `ogrm:`, whatever `-prefix` you use: a project-wide
+scan has to name one key up front, so the fleet prefix travels in the value.
+
+OpenStack has no single labelling mechanism, so each resource carries the set
+through whatever its API offers.
+
+| Resource                  | Carried as              | Visible with                          |
+| ------------------------- | ----------------------- | ------------------------------------- |
+| Network, subnet, router   | Neutron tags            | `openstack network show ogrm-acme-net` |
+| Instance                  | Nova server tags        | `openstack server show ogrm-acme-001` |
+| Boot volume               | Cinder volume metadata  | `openstack volume show ogrm-acme-001` |
+| Keypair                   | *(nothing)*             | name only                             |
+
+Nova keypairs support neither tags nor metadata, so a keypair stays identified
+by its name alone.
+
+Instances and volumes get their labels in the create call itself. Networks,
+subnets, and routers are tagged by a second call right after they are created,
+because Neutron takes no tags at create time. Discovery is therefore the union
+of both anchors — labels *and* name prefix — so a run interrupted between those
+two calls still leaves a network `delete` can find and remove. The same union is
+why a deployment created before labelling existed keeps working unchanged.
+
+Nothing labels a resource after the run that created it. A deployment from
+before this scheme, or one whose tag call failed, stays fully usable through
+`-name` but does not appear in `list -all`; recreating it labels it.
+
+Because the name prefix stays an anchor, a resource someone created by hand
+under a matching name is still discovered, and still deleted. `list` and the
+`delete` preview mark anything they matched on the name alone, so you see it
+before confirming:
+
+```
+  ! matched by name only, not by label: ogrm-acme-007
+    Either older than labelling, or created by hand under a colliding name.
+    delete removes them with the rest; re-creating the deployment labels them.
+```
+
+Tagging instances at create time needs **Nova microversion 2.52** (available
+since Queens, 2018). `ogrm` checks the compute service's version document when
+it connects and fails with a message naming the requirement if the cloud cannot
+serve it.
 
 ## Prerequisites
 
@@ -329,12 +384,29 @@ immediately.
 ### List
 
 ```shell
-bin/ogrm list -name acme
+bin/ogrm list -name acme     # one deployment
+bin/ogrm list -all           # every deployment in the project
 ```
 
-Shows every resource the deployment owns (by prefix), including which ones are
-missing — useful to inspect a partial create, or to spot an instance stuck in
-`ERROR`, before re-running `create` (which replaces it) or deleting.
+With `-name`, shows every resource that deployment owns, including which ones
+are missing — useful to inspect a partial create, or to spot an instance stuck
+in `ERROR`, before re-running `create` (which replaces it) or deleting.
+
+With `-all`, asks the cloud which deployments carry the `ogrm:fleet` label (see
+[Labels](#labels)) and prints each one in the same shape. This is how you find
+deployments whose names nobody wrote down; `-name` cannot, because it needs the
+name before it can look. Pass `-prefix` if the deployments were created with a
+non-default one. The two flags are mutually exclusive.
+
+`-all` sees only labelled resources, so a deployment created before labelling
+existed is not listed. Reach it with `-name`.
+
+| Flag                | Default              | Meaning                                    |
+| ------------------- | -------------------- | ------------------------------------------ |
+| `-name`             | *(none)*             | deployment to list; required unless `-all` |
+| `-all`              | `false`              | list every labelled deployment under `-prefix` |
+| `-prefix`           | `ogrm`               | leading token the resources were created with |
+| `-cloud`            | `OS_CLOUD`, else `openstack` | `clouds.yaml` entry to use          |
 
 ### Delete
 
@@ -343,9 +415,9 @@ bin/ogrm delete -name acme        # confirms first
 bin/ogrm delete -name acme -yes    # no prompt
 ```
 
-`delete` discovers resources by prefix and removes them in reverse dependency
-order: instances → boot volumes → router (interfaces detached) → subnet →
-network → keypair. It waits for each instance to disappear and then for its
+`delete` discovers resources by their labels and their name prefix, then removes
+them in reverse dependency order: instances → boot volumes → router (interfaces
+detached) → subnet → network → keypair. It waits for each instance to disappear and then for its
 boot volume to detach and become `available` (or to vanish, when
 `delete_on_termination` removed it with the instance) before deleting the
 volume — otherwise Cinder rejects the delete while the volume is still

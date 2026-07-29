@@ -18,6 +18,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/subnets"
 
+	"github.com/b42labs/openstack-github-runner-manager/internal/labels"
 	"github.com/b42labs/openstack-github-runner-manager/internal/naming"
 )
 
@@ -30,40 +31,46 @@ const (
 	volumeDeletableTimeout = 5 * time.Minute
 )
 
-// List discovers every resource the deployment owns by its shared prefix and
-// exact infra names, without deleting anything. It backs the `list` command
-// and lets an operator preview what `delete` would remove.
+// List discovers every resource the deployment owns, by the labels this tool
+// stamps on them and by their shared name prefix, without deleting anything. It
+// backs the `list` command and lets an operator preview what `delete` would
+// remove.
 func (m *Manager) List(ctx context.Context, names naming.Scheme) (*Fleet, error) {
 	fleet := &Fleet{}
-	prefix := names.Prefix()
 
-	srv, err := m.C.serversByPrefix(ctx, prefix)
+	srv, err := m.C.serversForCluster(ctx, names)
 	if err != nil {
 		return fleet, err
 	}
 	fleet.Servers = srv
 
-	vols, err := m.C.volumesByPrefix(ctx, prefix)
+	vols, err := m.C.volumesForCluster(ctx, names)
 	if err != nil {
 		return fleet, err
 	}
 	fleet.VolumeRefs = vols
 
-	if ref, ok, err := m.C.findRouterByName(ctx, names.Router()); err != nil {
+	var infra []ResourceRef
+	if ref, ok, err := m.C.findRouter(ctx, names); err != nil {
 		return fleet, err
 	} else if ok {
 		fleet.RouterID = ref.ID
+		infra = append(infra, ref)
 	}
-	if ref, ok, err := m.C.findSubnetByName(ctx, names.Subnet()); err != nil {
+	if ref, ok, err := m.C.findSubnet(ctx, names); err != nil {
 		return fleet, err
 	} else if ok {
 		fleet.SubnetID = ref.ID
+		infra = append(infra, ref)
 	}
-	if ref, ok, err := m.C.findNetworkByName(ctx, names.Network()); err != nil {
+	if ref, ok, err := m.C.findNetwork(ctx, names); err != nil {
 		return fleet, err
 	} else if ok {
 		fleet.NetworkID = ref.ID
+		infra = append(infra, ref)
 	}
+
+	fleet.Unlabelled = unlabelledNames(fleet.Servers, fleet.VolumeRefs, infra)
 
 	exists, err := m.C.keypairExists(ctx, names.Keypair())
 	if err != nil {
@@ -75,6 +82,62 @@ func (m *Manager) List(ctx context.Context, names naming.Scheme) (*Fleet, error)
 	return fleet, nil
 }
 
+// unlabelledNames collects the discovered resources that carry none of this
+// tool's labels, so a listing can show what it matched on the name prefix
+// alone. The keypair is excluded: nothing can label a keypair, so its name is
+// the only handle there has ever been and flagging it would be noise on every
+// single run.
+func unlabelledNames(srvs []ServerRef, volSets ...[]ResourceRef) []string {
+	var out []string
+	for _, s := range srvs {
+		if !s.Labelled {
+			out = append(out, s.Name)
+		}
+	}
+	for _, set := range volSets {
+		for _, r := range set {
+			if !r.Labelled {
+				out = append(out, r.Name)
+			}
+		}
+	}
+	return out
+}
+
+// ListClusters returns the names of every deployment this tool owns under the
+// given fleet prefix in the current OpenStack project, sorted. It is what lets
+// `list` answer "which clusters exist here" without being told a deployment
+// name, which the name-prefix scheme alone cannot do: a caller would have to
+// guess the names before it could look for them.
+//
+// Discovery here is label-only. A deployment created before labels existed, or
+// one whose neutron tag call failed, is absent from the result and stays
+// reachable only through `list -name`.
+func (m *Manager) ListClusters(ctx context.Context, fleet string) ([]string, error) {
+	found, err := m.C.networkResourcesForFleet(ctx, fleet)
+	if err != nil {
+		return nil, err
+	}
+
+	srv, err := m.C.serversForFleet(ctx, fleet)
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range srv {
+		found = append(found, s.Labels)
+	}
+
+	vols, err := m.C.volumesForFleet(ctx, fleet)
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range vols {
+		found = append(found, v.Labels)
+	}
+
+	return labels.Clusters(fleet, found), nil
+}
+
 // Teardown deletes everything the deployment owns, in reverse dependency
 // order: instances first, then their boot volumes, then the router (with its
 // internal interfaces detached), the subnet, the network, and finally the
@@ -82,12 +145,11 @@ func (m *Manager) List(ctx context.Context, names naming.Scheme) (*Fleet, error)
 // re-run still converges on "nothing left". Errors are collected and joined
 // so one stubborn resource does not abort the rest of the sweep.
 func (m *Manager) Teardown(ctx context.Context, names naming.Scheme) error {
-	prefix := names.Prefix()
 	var errs []error
 
 	// 1) Instances. Delete every match, then wait for each to disappear so
 	// the boot volumes detach before the volume sweep.
-	srvRefs, err := m.C.serversByPrefix(ctx, prefix)
+	srvRefs, err := m.C.serversForCluster(ctx, names)
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -108,7 +170,7 @@ func (m *Manager) Teardown(ctx context.Context, names naming.Scheme) error {
 	// deleting, wait for each volume to detach from its (now-deleted) instance
 	// and reach a deletable status — otherwise Cinder rejects the delete with
 	// "Volume status must be available ..." while it is still in-use.
-	volRefs, err := m.C.volumesByPrefix(ctx, prefix)
+	volRefs, err := m.C.volumesForCluster(ctx, names)
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -130,7 +192,7 @@ func (m *Manager) Teardown(ctx context.Context, names naming.Scheme) error {
 
 	// 3) Router: detach internal interfaces, then delete (the external
 	// gateway is removed automatically with the router).
-	if ref, ok, err := m.C.findRouterByName(ctx, names.Router()); err != nil {
+	if ref, ok, err := m.C.findRouter(ctx, names); err != nil {
 		errs = append(errs, err)
 	} else if ok {
 		if err := m.detachRouterInterfaces(ctx, ref.ID); err != nil {
@@ -143,7 +205,7 @@ func (m *Manager) Teardown(ctx context.Context, names naming.Scheme) error {
 	}
 
 	// 4) Subnet.
-	if ref, ok, err := m.C.findSubnetByName(ctx, names.Subnet()); err != nil {
+	if ref, ok, err := m.C.findSubnet(ctx, names); err != nil {
 		errs = append(errs, err)
 	} else if ok {
 		m.logf("Deleting subnet %s ...", names.Subnet())
@@ -153,7 +215,7 @@ func (m *Manager) Teardown(ctx context.Context, names naming.Scheme) error {
 	}
 
 	// 5) Network.
-	if ref, ok, err := m.C.findNetworkByName(ctx, names.Network()); err != nil {
+	if ref, ok, err := m.C.findNetwork(ctx, names); err != nil {
 		errs = append(errs, err)
 	} else if ok {
 		m.logf("Deleting network %s ...", names.Network())

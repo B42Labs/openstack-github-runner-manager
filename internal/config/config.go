@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/b42labs/openstack-github-runner-manager/internal/labels"
 	"github.com/b42labs/openstack-github-runner-manager/internal/naming"
 )
 
@@ -187,6 +188,13 @@ func (c *Config) Validate() error {
 	// the DNS label limit so the instance hostnames stay valid.
 	if longest := c.Fleet + "-" + c.Project + "-subnet"; len(longest) > maxNameLen {
 		return fmt.Errorf("fleet prefix %q and project %q are too long: %q is %d chars (max %d)", c.Fleet, c.Project, longest, len(longest), maxNameLen)
+	}
+	// The same two tokens are stamped onto every resource as labels, and a tag
+	// has a tighter limit than a resource name. Check it here so an over-long
+	// deployment name fails before the first resource is created rather than
+	// once the instance create is rejected.
+	if err := labels.Validate(c.Fleet, c.Project); err != nil {
+		return err
 	}
 	if c.Count < 1 || c.Count > maxCount {
 		return fmt.Errorf("count %d out of range (must be 1..%d)", c.Count, maxCount)

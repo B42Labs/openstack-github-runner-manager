@@ -51,6 +51,13 @@ type Fleet struct {
 	KeyPath       string
 	Servers       []ServerRef
 	VolumeRefs    []ResourceRef
+
+	// Unlabelled names the discovered resources that matched only on their name
+	// prefix and carry none of this tool's labels. They are either older than
+	// labelling or were created by hand under a colliding name, and nothing can
+	// tell those two apart from the outside. Teardown deletes them along with
+	// the rest, so the listing surfaces them before an operator confirms.
+	Unlabelled []string
 }
 
 // ServerRef is a created or discovered instance.
@@ -58,12 +65,20 @@ type ServerRef struct {
 	ID     string
 	Name   string
 	Status string
+
+	// Labelled records that discovery matched this instance on its labels
+	// rather than only on its name.
+	Labelled bool
 }
 
 // ResourceRef is a named cloud resource referenced during teardown/listing.
 type ResourceRef struct {
 	ID   string
 	Name string
+
+	// Labelled records that discovery matched this resource on its labels
+	// rather than only on its name.
+	Labelled bool
 }
 
 // HasAnything reports whether the fleet references at least one live cloud

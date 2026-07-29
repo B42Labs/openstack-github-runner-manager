@@ -117,6 +117,11 @@ func TestValidateRejects(t *testing.T) {
 		{"uppercase fleet", func(c *config.Config) { c.Fleet = "GHA" }, "fleet prefix"},
 		{"underscore fleet", func(c *config.Config) { c.Fleet = "g_a" }, "fleet prefix"},
 		{"fleet plus project too long", func(c *config.Config) { c.Fleet = strings.Repeat("a", 60) }, "too long"},
+		// A tag is capped tighter than a resource name, so there is a band of
+		// project names that fit ogrm-<project>-subnet but overflow
+		// ogrm:cluster=<project>. Rejecting it here beats having the cloud
+		// reject the first instance create after the network already exists.
+		{"project fits a name but not a label", func(c *config.Config) { c.Project = strings.Repeat("a", 50) }, "max 60"},
 		{"guard threshold zero", func(c *config.Config) { c.DiskGuard = true; c.DiskGuardThreshold = 0 }, "out of range"},
 		{"guard threshold full", func(c *config.Config) { c.DiskGuard = true; c.DiskGuardThreshold = 100 }, "out of range"},
 		{"guard interval too short", func(c *config.Config) { c.DiskGuard = true; c.DiskGuardInterval = time.Second }, "too short"},
