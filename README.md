@@ -46,8 +46,8 @@ Each instance receives cloud-init user-data that, in order:
 2. writes the embedded `install.sh` plus a root-only env file holding the
    repository URL, that instance's registration token, the runner name, and the
    disk guard settings,
-3. runs `install.sh`, which installs Docker, kubectl, kind, and helm, registers
-   the GitHub Actions runner as a systemd service, and installs the
+3. runs `install.sh`, which installs the [runner toolbox](#what-is-preinstalled),
+   registers the GitHub Actions runner as a systemd service, and installs the
    [disk guard](#keeping-the-disk-from-filling-up),
 4. reboots, so the upgraded kernel is active and the runner service comes up
    clean.
@@ -58,6 +58,37 @@ floating IP** and accept no inbound connections — which is all a self-hosted
 runner needs, since it registers with and long-polls GitHub from the inside.
 For debugging, reach an instance over the tenant network (e.g. a jump host)
 using its private IP and the generated key.
+
+## What is preinstalled
+
+A workflow that moves from `ubuntu-latest` to one of these runners inherits a
+much thinner machine: an Ubuntu cloud image ships neither the tool versions a
+hosted runner image bakes in nor most of the command-line utilities workflows
+assume. A missing binary surfaces as `command not found` and exit code 127 in
+whichever step touches it first — often deep into a long job. `install.sh`
+therefore provisions:
+
+| Group | What | Why it is not left to the workflow |
+| --- | --- | --- |
+| Container runtime | Docker CE from `download.docker.com` (engine, CLI, containerd, buildx, compose) | The Ubuntu `docker.io` package lags and omits buildx |
+| Kubernetes | `kubectl`, `kind`, `helm` (latest release each) | KinD-based e2e suites shell out to all three; `helm` in particular is rarely installed by an action |
+| YAML | `yq` — the **mikefarah/yq** Go binary, *not* the `yq` apt package | Workflows use v4 syntax (`yq eval`, `yq -i`, `yq 'keys \| .[]'`). The apt package is kislyuk/yq, a jq wrapper that would misparse those expressions instead of failing cleanly |
+| Build | `build-essential`, `make`, `jq`, `curl`, `tar`, `gnupg` | `go test -race` and any cgo build need a C toolchain |
+| Source & scripting | `git`, `python3` | `actions/checkout` clones with git (without it it falls back to a REST tarball and later `git describe`/`rev-parse` steps break); repository codegen runs `python3 hack/*.py` |
+| Archives | `unzip`, `zip`, `xz-utils`, `zstd` | Actions unpack tool downloads and artifacts from these; `actions/cache` uses zstd when present and silently degrades to gzip when absent |
+| Shell lint | `shellcheck` | The shell-lint make targets call it directly |
+| Chaos testing | `ipset`, `iptables`, plus the `ip_set*`, `xt_set`, `sch_netem` and `sch_tbf` kernel modules from `linux-modules-extra` | chaos-mesh NetworkChaos drives ipset/tc inside the target pod's netns against *this host's* kernel. Loading them up front means a suite does not have to apt-install a kernel package mid-run, out of its own timeout and needing passwordless sudo |
+
+The kernel modules are pinned in `/etc/modules-load.d/99-ogrm-chaos.conf` so a
+reboot does not undo them, and `linux-modules-extra` is installed for every
+kernel present under `/lib/modules` rather than just the running one — cloud-init
+upgrades the kernel *before* `install.sh` runs and reboots *after* it, so the
+kernel that will actually run jobs is not the one `uname -r` reports here.
+
+Everything a workflow pins itself stays the workflow's job: Go comes from
+`actions/setup-go`, Node from `actions/setup-node`, and version-pinned test
+tooling (chainsaw, flux, a specific kubectl) from the repository's own install
+scripts. Preinstalling those would only mask a pin the workflow already owns.
 
 ## Reconcile semantics
 

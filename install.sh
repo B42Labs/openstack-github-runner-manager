@@ -8,8 +8,11 @@
 # capable of running KinD (Kubernetes in Docker).
 #
 #   - Docker CE *upstream* (download.docker.com), NOT the Ubuntu repo package
-#   - kubectl + kind + helm (latest releases each)
-#   - KinD-relevant kernel limits (inotify) set persistently
+#   - kubectl + kind + helm + yq (latest releases each)
+#   - The command-line toolbox a GitHub-hosted runner image ships and an Ubuntu
+#     cloud image does not (git, python3, shellcheck, the archive formats)
+#   - KinD-relevant kernel limits (inotify) and the chaos-mesh NetworkChaos
+#     kernel modules, both set persistently
 #   - A disk guard that reclaims space between jobs, so the runner does not
 #     fill its filesystem with leftover KinD clusters and Docker layers
 #   - Runner installed as a systemd service running as user "ubuntu"
@@ -109,9 +112,30 @@ echo "==> Starting setup for user '${RUNNER_USER}' (arch=${DEB_ARCH}) ..."
 # compiler in PATH, Go silently defaults to CGO_ENABLED=0, that adapter
 # compiles to an empty package, and the workspace build-tag drift gate
 # fails the `lint` job with `undefined: miekg.Ctx`.
+#
+# The rest is the toolbox a GitHub-hosted `ubuntu-latest` image ships and an
+# Ubuntu cloud image does not. A workflow moved from a hosted runner to this one
+# assumes these are simply on PATH and dies with exit code 127 when they are
+# not:
+#
+#   git                 actions/checkout clones with it; without it the action
+#                       falls back to a REST tarball and every later step that
+#                       reads git state (describe, rev-parse, diff) breaks
+#   python3             repository codegen and fixture checks invoke
+#                       `python3 hack/*.py` directly (stdlib only - no pip/venv)
+#   unzip zip xz-utils  the archive formats actions unpack their tool downloads
+#                       and artifacts from
+#   zstd                actions/cache compresses with zstd when it finds it on
+#                       PATH and silently degrades to gzip when it does not
+#   shell linting       the shell-lint make targets call shellcheck directly
+#   ipset iptables      chaos-mesh NetworkChaos drives both inside the target
+#                       pod's netns; section 7 loads the matching kernel modules
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y build-essential ca-certificates curl gnupg jq make tar
+apt-get install -y \
+  build-essential ca-certificates curl gnupg jq make tar \
+  git python3 shellcheck unzip zip xz-utils zstd \
+  ipset iptables
 
 # --- 2) Install Docker CE upstream -------------------------------------------
 echo "==> Installing Docker CE (upstream) ..."
@@ -179,7 +203,25 @@ install -m 0755 "${HELM_TMP}/linux-${DEB_ARCH}/helm" /usr/local/bin/helm
 rm -rf "${HELM_TMP}"
 echo "==> helm: $(helm version --short)"
 
-# --- 6) KinD-relevant kernel limits -------------------------------------------
+# --- 6) Install yq ------------------------------------------------------------
+# Pipelines read their own YAML with yq: resolving a service ref out of a
+# release manifest (`yq -r '.["<service>"]' source-refs.yaml`), generating a
+# build matrix (`yq 'keys | .[]'`), and editing kind configs and kustomize
+# output in place (`yq -i`, `yq eval`). A job that hits a missing yq fails with
+# exit code 127 in whichever hack/ script touches YAML first.
+#
+# Deliberately NOT the Ubuntu `yq` package: that one is kislyuk/yq, a jq wrapper
+# with a different command surface (no `eval` subcommand, no `-i`). Installing
+# it would turn a clean "command not found" into expressions that parse as
+# something else - a far worse failure mode. Take the upstream Go binary.
+echo "==> Installing yq ..."
+YQ_VERSION="$(curl -fsSL https://api.github.com/repos/mikefarah/yq/releases/latest | jq -r .tag_name)"
+curl -fsSL -o /usr/local/bin/yq \
+  "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${DEB_ARCH}"
+chmod +x /usr/local/bin/yq
+echo "==> yq: $(yq --version)"
+
+# --- 7) Kernel settings for KinD and chaos testing ----------------------------
 # Multiple KinD nodes (containerd/kubelet per node) consume a lot of inotify
 # watches/instances. Without these limits the cluster dies with "too many open
 # files". Set persistently + apply immediately.
@@ -190,11 +232,57 @@ fs.inotify.max_user_instances = 512
 EOF
 sysctl --system >/dev/null
 
-# --- 7) Cap the log growth ----------------------------------------------------
+# chaos-mesh's NetworkChaos enters the target pod's network namespace and drives
+# ipset/iptables/tc there. KinD nodes share this host's kernel, so the modules
+# have to exist here. A suite that finds them missing either apt-installs
+# linux-modules-extra mid-run - which needs passwordless sudo and spends a
+# package install out of the job's own timeout - or degrades to failing
+# NetworkChaos cases. Load them at provisioning time instead, and persist the
+# list so a reboot does not undo it.
+echo "==> Loading kernel modules for chaos-mesh NetworkChaos ..."
+
+# ip_set, xt_set and the sch_* qdiscs ship in linux-modules-extra, which the
+# Ubuntu cloud images leave out. That package is tied to one exact kernel
+# version, and `uname -r` is the wrong one to key it on here: cloud-init runs
+# package_upgrade *before* this script and reboots *after* it, so the kernel
+# running right now is the pre-upgrade one and the kernel the runner will
+# actually execute jobs under is merely installed, not booted. Cover every
+# kernel unpacked under /lib/modules (the running one included) so the set is
+# complete whichever one comes up.
+#
+# A miss is a warning, not a failure: only the NetworkChaos suites need these,
+# and they degrade on their own when the modules are absent.
+KERNEL_VERSIONS="$(ls -1 /lib/modules 2>/dev/null; uname -r)"
+MODULES_EXTRA_OK=false
+while read -r kver; do
+  [[ -z "${kver}" ]] && continue
+  if apt-get install -y "linux-modules-extra-${kver}"; then
+    MODULES_EXTRA_OK=true
+  else
+    echo "    NOTE: linux-modules-extra-${kver} unavailable."
+  fi
+done < <(printf '%s\n' "${KERNEL_VERSIONS}" | sort -u)
+
+if [[ "${MODULES_EXTRA_OK}" != "true" ]]; then
+  echo "    WARNING: no linux-modules-extra package installed; NetworkChaos suites may fail."
+fi
+
+CHAOS_MODULES=(ip_set ip_set_hash_ip ip_set_hash_net xt_set sch_netem sch_tbf)
+{
+  echo "# Generated by ogrm install.sh - chaos-mesh NetworkChaos (ipset/tc) modules."
+  printf '%s\n' "${CHAOS_MODULES[@]}"
+} > /etc/modules-load.d/99-ogrm-chaos.conf
+
+for mod in "${CHAOS_MODULES[@]}"; do
+  modprobe "${mod}" 2>/dev/null \
+    || echo "    WARNING: modprobe ${mod} failed; NetworkChaos suites may fail."
+done
+
+# --- 8) Cap the log growth ----------------------------------------------------
 # A long-lived runner fills its disk from three directions: container logs that
 # grow without any bound, the systemd journal, and the Docker/KinD state a job
 # leaves behind. The first two are bounded here once and for all; the third is
-# what the disk guard in section 9 reclaims.
+# what the disk guard in section 10 reclaims.
 #
 # The log cap matters most for KinD: every node is a container that logs
 # kubelet/containerd chatter for the life of the cluster, and `docker system
@@ -231,7 +319,7 @@ CONF
   systemctl restart systemd-journald
 fi
 
-# --- 8) Set up the GitHub Actions runner --------------------------------------
+# --- 9) Set up the GitHub Actions runner --------------------------------------
 echo "==> Installing GitHub Actions runner ..."
 
 # Determine the latest runner version
@@ -272,7 +360,7 @@ else
   "
 fi
 
-# --- 9) Disk guard ------------------------------------------------------------
+# --- 10) Disk guard -----------------------------------------------------------
 # A self-hosted runner fills up because nothing between two jobs removes what
 # the previous one left behind: KinD clusters that outlived their job, every
 # image pulled or built, the BuildKit cache, and the runner's own _work tree.
@@ -578,7 +666,7 @@ EOF
   systemctl enable --now ogrm-disk-guard.timer
 fi
 
-# --- 10) Install as a systemd service (runs as ${RUNNER_USER}) ----------------
+# --- 11) Install as a systemd service (runs as ${RUNNER_USER}) ----------------
 echo "==> Installing runner as a systemd service ..."
 cd "${RUNNER_DIR}"
 ./svc.sh install "${RUNNER_USER}"
