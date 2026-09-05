@@ -10,13 +10,13 @@ module github.com/b42labs/openstack-github-runner-manager
 go 1.26
 
 require (
-	github.com/gophercloud/gophercloud/v2 v2.13.0
-	github.com/gophercloud/utils/v2 v2.0.0-20260424064311-2eeed4ceb3e9
+	github.com/gophercloud/gophercloud/v2 v2.14.0
+	github.com/gophercloud/utils/v2 v2.0.0-20260824073324-42b9474d09d4
 )
 
 require (
-	github.com/gofrs/uuid/v5 v5.4.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
+	github.com/gofrs/uuid/v5 v5.5.1 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
