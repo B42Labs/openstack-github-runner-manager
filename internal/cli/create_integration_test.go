@@ -142,6 +142,11 @@ func TestCreateFreshProvisionsAllInstances(t *testing.T) {
 		t.Errorf("a fresh deployment must create the shared resources: %+v", fake.gotPlan)
 	}
 	assertUserData(t, fake.gotSpec, f, map[int]string{1: "tok-1", 2: "tok-2"})
+	// The new instances record the repository, which is how `delete` later
+	// finds their runners to deregister.
+	if fake.gotSpec.RepoURL != itRepo {
+		t.Errorf("Spec.RepoURL = %q; want %q", fake.gotSpec.RepoURL, itRepo)
+	}
 	if strings.Contains(out, "offline") {
 		t.Errorf("a fresh create must not print the scale-down GitHub note:\n%s", out)
 	}
@@ -188,7 +193,7 @@ func TestCreateScaleDownRemovesFromTopAndWarns(t *testing.T) {
 		t.Errorf("scale-down renders no user-data, got %d documents", len(fake.gotSpec.UserData))
 	}
 	// The GitHub-side note must appear, naming the offline runners and pointing
-	// at the GitHub UI, because the cloud tool cannot deregister them.
+	// at the GitHub UI, because a scale-down does not deregister them.
 	for _, want := range []string{"offline", "Settings -> Actions -> Runners", itNames.Server(4)} {
 		if !strings.Contains(out, want) {
 			t.Errorf("scale-down summary missing %q:\n%s", want, out)

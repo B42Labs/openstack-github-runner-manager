@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 // Package github is a thin anti-corruption layer over the GitHub CLI (`gh`).
-// Its single job is to mint the short-lived registration token a self-hosted
-// runner needs to call config.sh, so an operator no longer fetches each token
-// by hand from Settings -> Actions -> Runners. It shells out to `gh api`,
-// reusing the operator's existing `gh auth login` session rather than handling
-// a personal access token itself.
+// It covers both ends of a runner's life in GitHub: minting the short-lived
+// registration token a self-hosted runner needs to call config.sh, so an
+// operator no longer fetches each token by hand from Settings -> Actions ->
+// Runners, and finding and deregistering those runners again once their
+// instances are torn down. It shells out to `gh api`, reusing the operator's
+// existing `gh auth login` session rather than handling a personal access
+// token itself.
 //
 // The package deliberately knows nothing about OpenStack, cloud-init, or the
-// fleet: it maps a GitHub org or org/repo URL to the matching
-// actions/runners/registration-token endpoint and returns the token string.
+// fleet: it maps a GitHub org or org/repo URL to the matching actions/runners
+// endpoints and speaks only in tokens and runners.
 package github
 
 import (
@@ -66,14 +68,24 @@ func (c *Client) MintRegistrationToken(ctx context.Context, repoURL string) (str
 }
 
 // registrationTokenPath maps a GitHub URL to the REST path that mints a runner
-// registration token. A single path segment names an organization, two name an
+// registration token.
+func registrationTokenPath(repoURL string) (string, error) {
+	base, err := runnersPath(repoURL)
+	if err != nil {
+		return "", err
+	}
+	return base + "/registration-token", nil
+}
+
+// runnersPath maps a GitHub URL to the REST collection of its self-hosted
+// runners. A single path segment names an organization, two name an
 // owner/repo; anything else is not a runner-bearing scope.
 //
 // DECISION: derive the scope from the URL the fleet already targets rather than
 // taking a separate --org/--repo flag. The runner registers against exactly
 // this URL (install.sh passes it to config.sh as --url), so a second source of
 // truth could drift from it; reading both from one value keeps them in lockstep.
-func registrationTokenPath(repoURL string) (string, error) {
+func runnersPath(repoURL string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(repoURL))
 	if err != nil {
 		return "", fmt.Errorf("repository URL %q is not valid: %w", repoURL, err)
@@ -83,11 +95,11 @@ func registrationTokenPath(repoURL string) (string, error) {
 	// the segment-count switch below treats it as "no org/repo named".
 	switch {
 	case len(segments) == 1 && segments[0] != "":
-		return fmt.Sprintf("/orgs/%s/actions/runners/registration-token", segments[0]), nil
+		return fmt.Sprintf("/orgs/%s/actions/runners", segments[0]), nil
 	case len(segments) == 2 && segments[0] != "" && segments[1] != "":
-		return fmt.Sprintf("/repos/%s/%s/actions/runners/registration-token", segments[0], segments[1]), nil
+		return fmt.Sprintf("/repos/%s/%s/actions/runners", segments[0], segments[1]), nil
 	default:
-		return "", fmt.Errorf("repository URL %q must name an org or org/repo to mint a runner token", repoURL)
+		return "", fmt.Errorf("repository URL %q must name an org or org/repo to manage its runners", repoURL)
 	}
 }
 

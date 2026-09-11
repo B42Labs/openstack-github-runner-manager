@@ -207,8 +207,10 @@ func createWith(ctx context.Context, f *createFlags, cfg config.Config, names na
 	// instance's cloud-init. A pure scale-down creates nothing, so it asks for
 	// neither.
 	userData := map[int][]byte{}
+	var repo string
 	if len(plan.InstancesToCreate) > 0 {
-		repo, tokens, err := resolveRepoAndTokens(f.repo, f.tokens, plan.InstancesToCreate, ask, mint)
+		var tokens []string
+		repo, tokens, err = resolveRepoAndTokens(f.repo, f.tokens, plan.InstancesToCreate, ask, mint)
 		if err != nil {
 			return err
 		}
@@ -240,6 +242,7 @@ func createWith(ctx context.Context, f *createFlags, cfg config.Config, names na
 		VolumeSize:                 cfg.VolumeSize,
 		VolumeType:                 cfg.VolumeType,
 		AvailabilityZone:           cfg.AvailabilityZone,
+		RepoURL:                    repo,
 		KeyOutPath:                 cfg.KeyOutPath,
 		DeleteVolumesOnTermination: cfg.DeleteVolumesOnTermination,
 		UserData:                   userData,
@@ -323,8 +326,8 @@ func diskGuardSummary(cfg config.Config) string {
 
 // printReconcileSummary closes out a successful reconcile: it reports the new
 // instances and, when instances were removed, reminds the operator that the
-// corresponding GitHub runners are still registered (now offline) and the
-// cloud-only tool cannot deregister them.
+// corresponding GitHub runners are still registered (now offline): only
+// `delete` deregisters runners, a scale-down does not.
 func printReconcileSummary(out io.Writer, name string, plan openstack.ReconcilePlan, fleet *openstack.Fleet) {
 	if len(plan.InstancesToCreate) > 0 {
 		fmt.Fprintf(out, "\nAdded %d instance(s); cloud-init will upgrade packages, run install.sh, and reboot.\n", len(plan.InstancesToCreate))
@@ -340,8 +343,8 @@ func printReconcileSummary(out io.Writer, name string, plan openstack.ReconcileP
 	}
 	if len(plan.InstancesToDelete) > 0 {
 		fmt.Fprintf(out, "\nRemoved %d instance(s): %s\n", len(plan.InstancesToDelete), joinRefNames(plan.InstancesToDelete))
-		fmt.Fprintln(out, "Note: their GitHub runners are still registered (now offline). This tool manages cloud resources only and")
-		fmt.Fprintln(out, "cannot deregister them — remove them under Settings -> Actions -> Runners in GitHub.")
+		fmt.Fprintln(out, "Note: their GitHub runners are still registered (now offline); a scale-down does not deregister them.")
+		fmt.Fprintln(out, "Remove them under Settings -> Actions -> Runners in GitHub, or let `delete` sweep them with the deployment.")
 	}
 	fmt.Fprintf(out, "\nDone. Deployment %q reconciled.\n", name)
 }
