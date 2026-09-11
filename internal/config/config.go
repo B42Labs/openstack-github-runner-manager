@@ -74,6 +74,10 @@ var labelPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 // are valid.
 const maxNameLen = 63
 
+// maxRepoURLLen is the longest repository URL an instance can record: nova caps
+// a server metadata value at 255 characters.
+const maxRepoURLLen = 255
+
 // Config is the validated description of a runner fleet's desired shape: how
 // many instances it should have, and what to boot them from. It does NOT carry
 // the per-instance registration tokens: those are operational secrets needed
@@ -260,6 +264,11 @@ func ValidateRepoURL(raw string) error {
 	}
 	if strings.Trim(u.Path, "/") == "" {
 		return fmt.Errorf("repository URL %q must name an org or org/repo path", raw)
+	}
+	// Each instance records the URL in its server metadata; an overlong one
+	// would fail the instance create after the network and volume were built.
+	if len(raw) > maxRepoURLLen {
+		return fmt.Errorf("repository URL is %d characters (max %d)", len(raw), maxRepoURLLen)
 	}
 	return nil
 }

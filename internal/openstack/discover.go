@@ -306,9 +306,16 @@ func (c *Clients) listServers(ctx context.Context, opts servers.ListOpts, keep f
 		if keep != nil && !keep(s) {
 			continue
 		}
-		out = append(out, ServerRef{ID: s.ID, Name: s.Name, Status: s.Status})
+		out = append(out, serverRef(s))
 	}
 	return out, nil
+}
+
+// serverRef maps a nova server onto what discovery reports about it, including
+// the repository its runner registered against, which `delete` needs to
+// deregister that runner.
+func serverRef(s servers.Server) ServerRef {
+	return ServerRef{ID: s.ID, Name: s.Name, Status: s.Status, RepoURL: s.Metadata[labels.KeyRepo]}
 }
 
 // serverTags returns a server's tags. Nova omits the field entirely below

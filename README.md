@@ -130,11 +130,12 @@ flags (`-flavor`, `-image`, `-volume-size`, `-volume-type`, `-disk-guard-*`)
 apply only to the instances being created; instances already running are left
 untouched.
 
-> **Scaling down leaves the GitHub runner registered.** This tool manages cloud
-> resources only. When it deletes an instance, the corresponding self-hosted
-> runner stays registered with GitHub and simply shows as *offline*. Remove it
-> under *Settings → Actions → Runners*; the command prints a reminder naming the
-> instances it removed.
+> **Scaling down leaves the GitHub runner registered.** When `create` deletes an
+> instance, the corresponding self-hosted runner stays registered with GitHub
+> and simply shows as *offline*. Remove it under *Settings → Actions → Runners*;
+> the command prints a reminder naming the instances it removed. `delete`, by
+> contrast, [deregisters the runners](#delete) with the deployment, these
+> offline leftovers included.
 
 ## Keeping the disk from filling up
 
@@ -251,6 +252,13 @@ through whatever its API offers.
 Nova keypairs support neither tags nor metadata, so a keypair stays identified
 by its name alone.
 
+Instances carry one more entry, `ogrm:repo`, as Nova server metadata: the
+GitHub URL their runner registered against. It is what lets `delete`
+[deregister the runners](#delete) without being told where they live, and it
+is metadata rather than a tag because a URL easily overflows the 60-character
+tag limit. Instances created by an older `ogrm` do not have it; pass `-repo` to
+`delete` for those.
+
 Instances and volumes get their labels in the create call itself. Networks,
 subnets, and routers are tagged by a second call right after they are created,
 because Neutron takes no tags at create time. Discovery is therefore the union
@@ -297,6 +305,8 @@ serve it.
   `gh` entirely, supply the tokens yourself with `-token` (one per new instance);
   fetch those under *Settings → Actions → Runners → New self-hosted runner*. Each
   token is short-lived (about an hour), so the fleet is created right after.
+  `delete` uses the same session to [deregister the runners](#delete) again;
+  `-keep-runners` skips that, and with it `gh`.
 
 ## Build
 
@@ -415,6 +425,8 @@ existed is not listed. Reach it with `-name`.
 ```shell
 bin/ogrm delete -name acme        # confirms first
 bin/ogrm delete -name acme -yes    # no prompt
+bin/ogrm delete -name acme -repo https://github.com/acme/example  # older deployment
+bin/ogrm delete -name acme -keep-runners                          # cloud side only
 ```
 
 `delete` discovers resources by their labels and their name prefix, then removes
@@ -426,6 +438,36 @@ volume — otherwise Cinder rejects the delete while the volume is still
 attached. Each step tolerates an already-missing resource, so a failed or
 partial `create` is cleaned up by re-running `delete`. If `create` fails midway
 it prints exactly this hint.
+
+After the teardown, `delete` also deregisters the deployment's runners from
+GitHub through `gh`. It looks in the repository each instance recorded when it
+was created (the `ogrm:repo` [metadata](#labels)) and removes every runner
+there named exactly `ogrm-<name>-NNN`. That includes runners an earlier
+scale-down left behind offline; a sibling deployment's runners and ones
+registered by hand are never touched. The preview lists the runners next to the
+cloud resources, so one confirmation covers both.
+
+- **Older deployments** recorded no repository, so their runners stay
+  registered unless you name it with `-repo`. When given, `-repo` is the only
+  repository `delete` looks in.
+- **Runners mid-job**: GitHub may refuse to remove a runner it still counts as
+  busy with the job its instance was killed in. `delete` deregisters the rest,
+  names the refused ones, and exits non-zero. Once their jobs have ended,
+  re-run `delete -name acme -repo <url>` (it works even when the cloud side is
+  already gone), or remove them under *Settings → Actions → Runners*.
+- **No GitHub access**: the runners are looked up before anything is deleted,
+  because the instances' metadata is the only record of where they live. If
+  `gh` cannot list them, `delete` stops with nothing deleted; pass
+  `-keep-runners` to delete the cloud side only.
+
+| Flag            | Default                       | Meaning                                    |
+| --------------- | ----------------------------- | ------------------------------------------ |
+| `-name`         | *(required)*                  | deployment to delete                       |
+| `-repo`         | *(recorded on the instances)* | GitHub repository to deregister the runners from |
+| `-keep-runners` | `false`                       | leave the runners registered with GitHub   |
+| `-prefix`       | `ogrm`                        | leading token the resources were created with |
+| `-cloud`        | `OS_CLOUD`, else `openstack`  | `clouds.yaml` entry to use                 |
+| `-yes`          | `false`                       | skip the confirmation prompt               |
 
 ## Security note: tokens in user-data
 
@@ -444,10 +486,13 @@ only once, at creation time.
 ## Testing
 
 The pure logic — the naming scheme, config validation, cloud-init rendering,
-the reconcile diff (`PlanReconcile`), the GitHub token minting (with a stubbed
-`gh`), and the prompt/flag handling — is covered by unit tests, and the create
-flow's decision logic (grow, shrink, gap-fill, replace-broken, no-op, auto-mint)
-is covered by an integration test that drives the command against a fake cloud.
+the reconcile diff (`PlanReconcile`), the GitHub token minting and runner
+listing/deregistration (with a stubbed `gh`), and the prompt/flag handling — is
+covered by unit tests. The create flow's decision logic (grow, shrink, gap-fill,
+replace-broken, no-op, auto-mint) is covered by an integration test that drives
+the command against a fake cloud, and the delete flow's (which runners it
+deregisters, from where, and only after the teardown) by one that adds a fake
+GitHub.
 
 The disk guard is shell, so it has its own test
 (`hack/test-disk-guard.sh`): it extracts the guard body out of `install.sh`,
@@ -481,7 +526,8 @@ bin/ogrm create -name acme -count 3   # replace: deletes the ERROR instance + it
                                       # volume, then rebuilds that slot from a fresh volume
 
 bin/ogrm create -name acme -count 1   # shrink: removes 003, 002 from the top
-# ... the two removed runners now show as offline in GitHub; remove them there ...
+# ... the two removed runners now show as offline in GitHub ...
 
-bin/ogrm delete -name acme -yes
+bin/ogrm delete -name acme -yes       # also deregisters 001 and the two offline runners
+# ... verify Settings → Actions → Runners lists no ogrm-acme-NNN any more ...
 ```

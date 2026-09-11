@@ -65,3 +65,34 @@ func TestUnnumberedResourceCarriesNoIndexTag(t *testing.T) {
 		}
 	}
 }
+
+// The repository an instance's runner registers against rides in the same
+// create call, as server metadata. `delete` reads it back to deregister the
+// runner, so losing it in the keypair wrapper would leave every runner
+// registered after its instance is gone.
+func TestServerCreateBodyCarriesTheRepoThroughTheKeypairWrapper(t *testing.T) {
+	const repo = "https://github.com/acme/example"
+	base := servers.CreateOpts{
+		Name:      "ogrm-acme-004",
+		FlavorRef: "flavor-id",
+		Networks:  []servers.Network{{UUID: "net-id"}},
+		Metadata:  repoMetadata(repo),
+	}
+	withKey := keypairs.CreateOptsExt{CreateOptsBuilder: base, KeyName: "ogrm-acme-key"}
+
+	body, err := withKey.ToServerCreateMap()
+	if err != nil {
+		t.Fatalf("build create body: %v", err)
+	}
+	server, ok := body["server"].(map[string]any)
+	if !ok {
+		t.Fatalf("create body has no server object: %v", body)
+	}
+	md, ok := server["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("create body carries no metadata: %v", server)
+	}
+	if md[labels.KeyRepo] != repo {
+		t.Errorf("metadata[%q] = %v; want %q", labels.KeyRepo, md[labels.KeyRepo], repo)
+	}
+}

@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+
 	"github.com/b42labs/openstack-github-runner-manager/internal/labels"
 	"github.com/b42labs/openstack-github-runner-manager/internal/naming"
 )
@@ -154,5 +156,23 @@ func TestClusterTagFilterUsesTheDefaultFleetPrefix(t *testing.T) {
 	want := "ogrm:fleet=" + naming.DefaultFleetPrefix + ",ogrm:cluster=acme,ogrm:role=server"
 	if got != want {
 		t.Errorf("clusterTagFilter() = %q; want %q", got, want)
+	}
+}
+
+// Discovery reads back the repository an instance recorded at create time,
+// since that is where `delete` learns which GitHub runners to deregister. An
+// instance created before ogrm recorded it reports none.
+func TestServerRefReadsTheRecordedRepo(t *testing.T) {
+	got := serverRef(servers.Server{
+		ID: "id-1", Name: "ogrm-acme-001", Status: "ACTIVE",
+		Metadata: map[string]string{labels.KeyRepo: "https://github.com/acme/example"},
+	})
+	want := ServerRef{ID: "id-1", Name: "ogrm-acme-001", Status: "ACTIVE", RepoURL: "https://github.com/acme/example"}
+	if got != want {
+		t.Errorf("serverRef() = %+v; want %+v", got, want)
+	}
+
+	if older := serverRef(servers.Server{ID: "id-2", Name: "ogrm-acme-002"}); older.RepoURL != "" {
+		t.Errorf("an instance without the metadata reports repo %q; want none", older.RepoURL)
 	}
 }

@@ -111,6 +111,7 @@ func TestValidateRejects(t *testing.T) {
 		{"count too high", func(c *config.Config) { c.Count = 1000 }, "out of range"},
 		{"repo no scheme", func(c *config.Config) { c.RepoURL = "github.com/x/y" }, "must use http or https"},
 		{"repo no path", func(c *config.Config) { c.RepoURL = "https://github.com" }, "must name an org"},
+		{"repo too long for metadata", func(c *config.Config) { c.RepoURL = "https://github.com/acme/" + strings.Repeat("a", 240) }, "max 255"},
 		{"bad cidr", func(c *config.Config) { c.SubnetCIDR = "not-a-cidr" }, "not valid"},
 		{"tiny volume", func(c *config.Config) { c.VolumeSize = 0; c.SubnetCIDR = "192.168.200.0/24" }, ""},
 		{"empty fleet", func(c *config.Config) { c.Fleet = "" }, "fleet prefix is required"},

@@ -22,6 +22,11 @@ type Spec struct {
 	VolumeType       string // Cinder volume type for the boot volume
 	AvailabilityZone string // optional
 
+	// RepoURL is the GitHub org or org/repo URL the new instances' runners
+	// register against. Each new instance records it in its server metadata,
+	// which is where `delete` finds it again to deregister the runners.
+	RepoURL string
+
 	// KeyOutPath is where the generated private key is written.
 	KeyOutPath string
 
@@ -69,6 +74,11 @@ type ServerRef struct {
 	// Labelled records that discovery matched this instance on its labels
 	// rather than only on its name.
 	Labelled bool
+
+	// RepoURL is the GitHub URL the instance's runner registered against, read
+	// back from its server metadata. It is empty for an instance created before
+	// ogrm recorded it.
+	RepoURL string
 }
 
 // ResourceRef is a named cloud resource referenced during teardown/listing.

@@ -276,6 +276,9 @@ func (m *Manager) createInstances(ctx context.Context, plan ReconcilePlan, spec 
 			// Tags travel in the create call, so an instance is never visible
 			// untagged. This is what the compute client's 2.52 microversion buys.
 			Tags: labels.ForIndex(spec.Names.Fleet, spec.Names.Project, labels.RoleServer, idx).Tags(),
+			// The repository rides along as metadata instead: a URL does not fit
+			// the tag limit. `delete` reads it back to deregister the runner.
+			Metadata: repoMetadata(spec.RepoURL),
 			BlockDevice: []servers.BlockDevice{{
 				BootIndex:           0,
 				UUID:                volID,
@@ -292,6 +295,16 @@ func (m *Manager) createInstances(ctx context.Context, plan ReconcilePlan, spec 
 		fleet.Servers = append(fleet.Servers, ServerRef{ID: srv.ID, Name: srvName, Status: srv.Status})
 	}
 	return nil
+}
+
+// repoMetadata renders the server metadata that records where an instance's
+// runner registers. An unknown repository records nothing: an empty value would
+// read back the same as no value at all.
+func repoMetadata(repoURL string) map[string]string {
+	if repoURL == "" {
+		return nil
+	}
+	return map[string]string{labels.KeyRepo: repoURL}
 }
 
 // ensureBootVolume returns the ID of the boot volume for the given instance

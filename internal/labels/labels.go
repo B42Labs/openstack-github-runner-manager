@@ -39,6 +39,13 @@ const (
 	KeyIndex   = "ogrm:index"
 )
 
+// KeyRepo records the GitHub org or org/repo URL an instance's runner
+// registered against, so `delete` can deregister the runner without being told
+// where it lives. It is not part of a Set: only instances register runners, and
+// a URL does not fit the 60-character tag limit, so it travels as nova server
+// metadata alone.
+const KeyRepo = "ogrm:repo"
+
 // Role is the kind of resource a label set describes. It is the one label that
 // differs between the resources of a single cluster.
 type Role string
