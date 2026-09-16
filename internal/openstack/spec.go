@@ -27,6 +27,10 @@ type Spec struct {
 	// which is where `delete` finds it again to deregister the runners.
 	RepoURL string
 
+	// Labels is the extra runner label list the new instances were configured
+	// with, recorded in their server metadata so `update` can carry it over.
+	Labels string
+
 	// KeyOutPath is where the generated private key is written.
 	KeyOutPath string
 
@@ -79,6 +83,16 @@ type ServerRef struct {
 	// back from its server metadata. It is empty for an instance created before
 	// ogrm recorded it.
 	RepoURL string
+
+	// Labels is the extra runner label list the instance was created with,
+	// read back from its server metadata; empty when none were given or the
+	// instance predates recording them.
+	Labels string
+
+	// Flavor and AvailabilityZone describe how the instance is running, as nova
+	// reports them, so a rebuild can keep the same shape. Flavor is the name.
+	Flavor           string
+	AvailabilityZone string
 }
 
 // ResourceRef is a named cloud resource referenced during teardown/listing.
@@ -89,6 +103,14 @@ type ResourceRef struct {
 	// Labelled records that discovery matched this resource on its labels
 	// rather than only on its name.
 	Labelled bool
+
+	// Size (GiB), VolumeType, and ImageName describe a discovered boot volume
+	// — how big it is, of which type, and which image it was created from —
+	// so a rebuild can keep the same shape. They are zero for the shared
+	// infrastructure, which has none of them.
+	Size       int
+	VolumeType string
+	ImageName  string
 }
 
 // HasAnything reports whether the fleet references at least one live cloud

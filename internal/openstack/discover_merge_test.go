@@ -165,14 +165,20 @@ func TestClusterTagFilterUsesTheDefaultFleetPrefix(t *testing.T) {
 func TestServerRefReadsTheRecordedRepo(t *testing.T) {
 	got := serverRef(servers.Server{
 		ID: "id-1", Name: "ogrm-acme-001", Status: "ACTIVE",
-		Metadata: map[string]string{labels.KeyRepo: "https://github.com/acme/example"},
+		Metadata:         map[string]string{labels.KeyRepo: "https://github.com/acme/example", labels.KeyLabels: "kind,large"},
+		Flavor:           map[string]any{"id": "f-1", "original_name": "SCS-8V-32"},
+		AvailabilityZone: "nova",
 	})
-	want := ServerRef{ID: "id-1", Name: "ogrm-acme-001", Status: "ACTIVE", RepoURL: "https://github.com/acme/example"}
+	want := ServerRef{
+		ID: "id-1", Name: "ogrm-acme-001", Status: "ACTIVE",
+		RepoURL: "https://github.com/acme/example", Labels: "kind,large",
+		Flavor: "SCS-8V-32", AvailabilityZone: "nova",
+	}
 	if got != want {
 		t.Errorf("serverRef() = %+v; want %+v", got, want)
 	}
 
-	if older := serverRef(servers.Server{ID: "id-2", Name: "ogrm-acme-002"}); older.RepoURL != "" {
-		t.Errorf("an instance without the metadata reports repo %q; want none", older.RepoURL)
+	if older := serverRef(servers.Server{ID: "id-2", Name: "ogrm-acme-002", Flavor: map[string]any{"id": "f-1"}}); older.RepoURL != "" || older.Labels != "" || older.Flavor != "" {
+		t.Errorf("an instance without the metadata or a flavor name reports %+v; want none", older)
 	}
 }

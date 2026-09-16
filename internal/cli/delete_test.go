@@ -42,21 +42,54 @@ type fakeRegistry struct {
 	listErr   error
 	deleteErr map[int64]error
 
+	// beforeList, when set, runs at the start of every ListRunners call so a
+	// test can move runners between busy and idle as the update loop polls.
+	beforeList func(f *fakeRegistry)
+
 	listed []string
 	events *[]string
 }
 
 func (f *fakeRegistry) ListRunners(_ context.Context, repoURL string) ([]github.Runner, error) {
+	if f.beforeList != nil {
+		f.beforeList(f)
+	}
 	f.listed = append(f.listed, repoURL)
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	return f.runners[repoURL], nil
+	return append([]github.Runner(nil), f.runners[repoURL]...), nil
 }
 
+// DeleteRunner records the deregistration and, like GitHub, drops the runner
+// from later listings unless it refuses.
 func (f *fakeRegistry) DeleteRunner(_ context.Context, repoURL string, id int64) error {
 	*f.events = append(*f.events, fmt.Sprintf("deregister %s %d", repoURL, id))
-	return f.deleteErr[id]
+	if err := f.deleteErr[id]; err != nil {
+		return err
+	}
+	kept := f.runners[repoURL][:0:0]
+	for _, r := range f.runners[repoURL] {
+		if r.ID != id {
+			kept = append(kept, r)
+		}
+	}
+	f.runners[repoURL] = kept
+	return nil
+}
+
+// setRunner replaces (or adds) the runner of the given name in repoURL.
+func (f *fakeRegistry) setRunner(repoURL string, r github.Runner) {
+	for i, cur := range f.runners[repoURL] {
+		if cur.Name == r.Name {
+			f.runners[repoURL][i] = r
+			return
+		}
+	}
+	if f.runners == nil {
+		f.runners = map[string][]github.Runner{}
+	}
+	f.runners[repoURL] = append(f.runners[repoURL], r)
 }
 
 // deleteFixture wires a fake cloud holding the given deployment to a fake

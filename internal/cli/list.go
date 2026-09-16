@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -128,13 +129,13 @@ func printListing(out io.Writer, names naming.Scheme, fleet *openstack.Fleet) {
 	if len(fleet.Servers) > 0 {
 		fmt.Fprintln(out, "  Instances:")
 		for _, s := range fleet.Servers {
-			fmt.Fprintf(out, "    %-16s %-8s %s\n", s.Name, s.Status, s.ID)
+			fmt.Fprintf(out, "    %-16s %-8s %s%s\n", s.Name, s.Status, s.ID, serverShape(s))
 		}
 	}
 	if len(fleet.VolumeRefs) > 0 {
 		fmt.Fprintln(out, "  Volumes:")
 		for _, v := range fleet.VolumeRefs {
-			fmt.Fprintf(out, "    %-16s %s\n", v.Name, v.ID)
+			fmt.Fprintf(out, "    %-16s %s%s\n", v.Name, v.ID, volumeShape(v))
 		}
 	}
 
@@ -145,6 +146,42 @@ func printListing(out io.Writer, names naming.Scheme, fleet *openstack.Fleet) {
 		fmt.Fprintln(out, "    Either older than labelling, or created by hand under a colliding name.")
 		fmt.Fprintln(out, "    delete removes them with the rest; re-creating the deployment labels them.")
 	}
+}
+
+// serverShape and volumeShape append what discovery learned about how an
+// instance or boot volume was built, which is what `update` keeps by default.
+func serverShape(s openstack.ServerRef) string {
+	var parts []string
+	if s.Flavor != "" {
+		parts = append(parts, "flavor "+s.Flavor)
+	}
+	if s.AvailabilityZone != "" {
+		parts = append(parts, "az "+s.AvailabilityZone)
+	}
+	if s.Labels != "" {
+		parts = append(parts, "labels "+s.Labels)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "  (" + strings.Join(parts, ", ") + ")"
+}
+
+func volumeShape(v openstack.ResourceRef) string {
+	var parts []string
+	if v.Size > 0 {
+		parts = append(parts, fmt.Sprintf("%d GiB", v.Size))
+	}
+	if v.VolumeType != "" {
+		parts = append(parts, "type "+v.VolumeType)
+	}
+	if v.ImageName != "" {
+		parts = append(parts, "from "+strconv.Quote(v.ImageName))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "  (" + strings.Join(parts, ", ") + ")"
 }
 
 func idOrDash(name, id string) string {

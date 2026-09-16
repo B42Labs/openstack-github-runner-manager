@@ -1,7 +1,7 @@
 # OpenStack GitHub Runner Manager (`ogrm`)
 
-Provision a fleet of self-hosted GitHub Actions runners on **OpenStack**, and
-tear it down again, with a single Go binary. The command is called `ogrm`,
+Provision a fleet of self-hosted GitHub Actions runners on **OpenStack**, roll
+a fresh build through it, and tear it down again, with a single Go binary. The command is called `ogrm`,
 short for *openstack-github-runner-manager*.
 
 `install.sh` (in this repository) does the *in-VM* work: it turns a fresh Ubuntu
@@ -147,6 +147,10 @@ either). Pass `-token` once per new instance to supply your own instead of
 minting. The command always prints the plan — what it will reuse, add, and
 remove — and asks for confirmation before it changes anything (skip with `-yes`).
 
+`create` never replaces an instance that is healthy. To roll a fresh image or a
+newer `install.sh` through instances that are running fine, use
+[`update`](#update), which rebuilds them one at a time once their runner is idle.
+
 Because existing shared infrastructure is reused as-is, flags that shape it
 (`-subnet-cidr`, `-dns`, `-external`) have **no effect** once the resource
 exists; the command warns when you pass one that cannot apply. Per-instance
@@ -276,12 +280,18 @@ through whatever its API offers.
 Nova keypairs support neither tags nor metadata, so a keypair stays identified
 by its name alone.
 
-Instances carry one more entry, `ogrm:repo`, as Nova server metadata: the
-GitHub URL their runner registered against. It is what lets `delete`
-[deregister the runners](#delete) without being told where they live, and it
-is metadata rather than a tag because a URL easily overflows the 60-character
-tag limit. Instances created by an older `ogrm` do not have it; pass `-repo` to
-`delete` for those.
+Instances carry two more entries as Nova server metadata rather than tags,
+because either value easily overflows the 60-character tag limit:
+
+| Metadata      | Value                                                     |
+| ------------- | --------------------------------------------------------- |
+| `ogrm:repo`   | the GitHub URL the instance's runner registered against   |
+| `ogrm:labels` | the extra runner labels it was created with (`-labels`), if any |
+
+The repository is what lets `delete` [deregister the runners](#delete) without
+being told where they live; both are what lets [`update`](#update) rebuild an
+instance as it was. Instances created by an older `ogrm` have neither; pass
+`-repo` to `delete` for those, and `-labels` to `update` if they had any.
 
 Instances and volumes get their labels in the create call itself. Networks,
 subnets, and routers are tagged by a second call right after they are created,
@@ -330,7 +340,9 @@ serve it.
   fetch those under *Settings → Actions → Runners → New self-hosted runner*. Each
   token is short-lived (about an hour), so the fleet is created right after.
   `delete` uses the same session to [deregister the runners](#delete) again;
-  `-keep-runners` skips that, and with it `gh`.
+  `-keep-runners` skips that, and with it `gh`. [`update`](#update) needs
+  `gh` for all three: to see whether a runner is busy, to deregister it, and to
+  mint the token for its replacement.
 
 ## Build
 
@@ -426,7 +438,9 @@ bin/ogrm list -all           # every deployment in the project
 
 With `-name`, shows every resource that deployment owns, including which ones
 are missing — useful to inspect a partial create, or to spot an instance stuck
-in `ERROR`, before re-running `create` (which replaces it) or deleting.
+in `ERROR`, before re-running `create` (which replaces it) or deleting. Each
+instance is shown with its flavor, zone, and labels, and each boot volume with
+its size, type, and source image, which is the shape [`update`](#update) keeps.
 
 With `-all`, asks the cloud which deployments carry the `ogrm:fleet` label (see
 [Labels](#labels)) and prints each one in the same shape. This is how you find
@@ -443,6 +457,84 @@ existed is not listed. Reach it with `-name`.
 | `-all`              | `false`              | list every labelled deployment under `-prefix` |
 | `-prefix`           | `ogrm`               | leading token the resources were created with |
 | `-cloud`            | `OS_CLOUD`, else `openstack` | `clouds.yaml` entry to use          |
+
+### Update
+
+```shell
+bin/ogrm update -name acme                       # rebuild every instance, one at a time
+bin/ogrm update -name acme -image "Ubuntu 24.04" # same, from a named image
+bin/ogrm update -name acme -only 2,3             # only ogrm-acme-002 and -003
+bin/ogrm update -name acme -idle-timeout 2h -yes # unattended, bounded wait
+```
+
+`update` rolls a fresh build through an existing deployment without changing
+its size. It rebuilds the instances **one at a time, in ascending order**, and
+for each one:
+
+1. **waits until the runner is idle** — it polls GitHub every `-poll-interval`
+   (30s) until the runner named like the instance reports not busy. A running
+   job is never interrupted; by default the wait has no limit (`-idle-timeout`
+   bounds it). A name GitHub does not know at all (a build that never
+   registered, or an earlier update that died half-way) needs no wait;
+2. **deregisters the runner** from GitHub. This happens *before* the instance
+   is deleted: GitHub refuses to remove a runner that is busy, so a job that
+   starts between the idle check and the deregistration is caught rather than
+   killed, and the loop goes back to waiting;
+3. **deletes the instance and its boot volume**, then **creates the same
+   index again** from a fresh boot volume, with a registration token minted at
+   that moment (a token minted up front would expire during a long wait);
+4. **waits for the new runner to come online**, up to `-ready-timeout` (30m),
+   before moving on. So at most one runner is out of service at any time, and
+   an image that fails to boot into a working runner stops the rollout on the
+   first instance instead of being rolled through the whole fleet
+   (`-ready-timeout 0` skips this wait).
+
+Each rebuilt instance **keeps the shape of the one it replaces**: its flavor
+and availability zone (read from nova), its boot volume's size, type, and
+source image (read from cinder), and its extra runner labels (recorded on the
+instance at create time, see [Labels](#labels)). So an update with no further
+flags means exactly "the same machine, freshly built": the current state of
+that image name, the current `install.sh`, and the latest release of every
+tool it installs. The same per-instance flags `create` takes (`-image`,
+`-flavor`, `-volume-size`, `-volume-type`, `-labels`, `-availability-zone`)
+override one property on every instance being rebuilt and leave the others as
+each instance had them; a property that can be read from neither the instance
+nor a flag — an instance created before ogrm recorded its labels, or a
+counter in `-only` whose instance is gone — falls back to `create`'s default.
+The disk guard settings are not read back from an instance and follow the
+`-disk-guard-*` flags, on by default as for `create`. The command prints the
+plan — which instances, in which order, and the exact shape each one is
+rebuilt with — and asks for confirmation before it starts (skip with `-yes`).
+
+The runners are looked up in, and the rebuilt ones registered against, the
+repository the instances recorded when they were created (the `ogrm:repo`
+[metadata](#labels)); `-repo` overrides it. Instances that recorded different
+repositories cannot be updated as one batch without `-repo` saying which one
+wins, and instances that recorded none prompt for it.
+
+An update that stops part-way — a rebuild that fails, a runner that never
+comes online, Ctrl-C — leaves the instances it finished updated and the rest
+untouched, and the error names how to continue: `update -name acme -only N,…`
+with the outstanding counters. A counter named in `-only` whose instance is
+already gone (the update died between the delete and the rebuild) is created
+again rather than skipped, so that resume works; a leftover volume under its
+name is deleted, never reused. `update` needs the deployment's network, subnet,
+and router to exist; a deployment missing one of them is repaired with
+`create` first.
+
+| Flag              | Default                       | Meaning                                    |
+| ----------------- | ----------------------------- | ------------------------------------------ |
+| `-name`           | *(required)*                  | deployment to update                       |
+| `-only`           | *(every instance)*            | comma-separated instance counters to rebuild (`2,3` or `002,003`) |
+| `-repo`           | *(recorded on the instances)* | GitHub repository the runners belong to    |
+| `-poll-interval`  | `30s`                         | how often GitHub is asked whether a runner is idle or online |
+| `-idle-timeout`   | `0` (no limit)                | give up on an instance whose runner stays busy this long |
+| `-ready-timeout`  | `30m`                         | how long to wait for a rebuilt runner to come online (`0` = do not wait) |
+| `-image`, `-flavor`, `-volume-size`, `-volume-type`, `-labels`, `-availability-zone` | *(kept from each instance)* | override that one property on every rebuilt instance |
+| `-disk-guard-*`, `-no-disk-guard` | *(as for `create`)*  | disk guard settings for the rebuilt instances |
+| `-prefix`         | `ogrm`                        | leading token the resources were created with |
+| `-cloud`          | `OS_CLOUD`, else `openstack`  | `clouds.yaml` entry to use                 |
+| `-yes`            | `false`                       | skip the confirmation prompt               |
 
 ### Delete
 
@@ -514,9 +606,12 @@ the reconcile diff (`PlanReconcile`), the GitHub token minting and runner
 listing/deregistration (with a stubbed `gh`), and the prompt/flag handling — is
 covered by unit tests. The create flow's decision logic (grow, shrink, gap-fill,
 replace-broken, no-op, auto-mint) is covered by an integration test that drives
-the command against a fake cloud, and the delete flow's (which runners it
+the command against a fake cloud, the delete flow's (which runners it
 deregisters, from where, and only after the teardown) by one that adds a fake
-GitHub.
+GitHub, and the update flow's (waiting for a busy runner, retrying a
+deregistration GitHub refused, rebuilding in order, stopping on a failed
+rebuild or a runner that never comes online, resuming with `-only`) by one
+whose fake cloud and fake GitHub change state as the loop acts on them.
 
 The disk guard is shell, so it has its own test
 (`hack/test-disk-guard.sh`): it extracts the guard body out of `install.sh`,
@@ -548,6 +643,10 @@ bin/ogrm list   -name acme            # ... 001..003 present ...
 bin/ogrm list   -name acme            # ... confirm the ERROR status ...
 bin/ogrm create -name acme -count 3   # replace: deletes the ERROR instance + its
                                       # volume, then rebuilds that slot from a fresh volume
+
+bin/ogrm update -name acme            # roll a fresh build through 001..003, one at a
+                                      # time, each once its runner is idle
+# ... every runner shows online again under Settings → Actions → Runners ...
 
 bin/ogrm create -name acme -count 1   # shrink: removes 003, 002 from the top
 # ... the two removed runners now show as offline in GitHub ...

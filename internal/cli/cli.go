@@ -4,7 +4,7 @@
 // Package cli is the command-line front end for the runner fleet tool. It
 // parses arguments, prompts for the repository URL, mints the per-instance
 // registration tokens through the GitHub CLI (or takes them from -token), and
-// drives the openstack adapter to create, list, or delete a fleet.
+// drives the openstack adapter to create, update, list, or delete a fleet.
 package cli
 
 import (
@@ -43,6 +43,8 @@ func Run(args []string, env *Env) int {
 	switch cmd {
 	case "create", "up":
 		err = runCreate(rest, env)
+	case "update", "upgrade":
+		err = runUpdate(rest, env)
 	case "delete", "destroy", "down":
 		err = runDelete(rest, env)
 	case "list", "ls":
@@ -86,6 +88,9 @@ Commands:
             then bootstrap each instance into a runner via cloud-init.
   list      Show the resources owned by a deployment, or every deployment
             in the project with -all.
+  update    Rebuild a deployment's instances one at a time: wait until a
+            runner is idle, deregister it, delete the instance, and create
+            it again under the same name from a fresh image.
   delete    Delete every resource owned by a deployment and deregister
             its runners from GitHub.
   version   Print version information.

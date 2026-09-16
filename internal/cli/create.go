@@ -243,6 +243,7 @@ func createWith(ctx context.Context, f *createFlags, cfg config.Config, names na
 		VolumeType:                 cfg.VolumeType,
 		AvailabilityZone:           cfg.AvailabilityZone,
 		RepoURL:                    repo,
+		Labels:                     cfg.Labels,
 		KeyOutPath:                 cfg.KeyOutPath,
 		DeleteVolumesOnTermination: cfg.DeleteVolumesOnTermination,
 		UserData:                   userData,

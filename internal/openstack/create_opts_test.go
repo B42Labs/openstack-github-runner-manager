@@ -76,7 +76,7 @@ func TestServerCreateBodyCarriesTheRepoThroughTheKeypairWrapper(t *testing.T) {
 		Name:      "ogrm-acme-004",
 		FlavorRef: "flavor-id",
 		Networks:  []servers.Network{{UUID: "net-id"}},
-		Metadata:  repoMetadata(repo),
+		Metadata:  serverMetadata(repo, "kind,large"),
 	}
 	withKey := keypairs.CreateOptsExt{CreateOptsBuilder: base, KeyName: "ogrm-acme-key"}
 
@@ -94,5 +94,11 @@ func TestServerCreateBodyCarriesTheRepoThroughTheKeypairWrapper(t *testing.T) {
 	}
 	if md[labels.KeyRepo] != repo {
 		t.Errorf("metadata[%q] = %v; want %q", labels.KeyRepo, md[labels.KeyRepo], repo)
+	}
+	if md[labels.KeyLabels] != "kind,large" {
+		t.Errorf("metadata[%q] = %v; want the runner labels", labels.KeyLabels, md[labels.KeyLabels])
+	}
+	if serverMetadata("", "") != nil {
+		t.Error("nothing to record must yield no metadata at all")
 	}
 }

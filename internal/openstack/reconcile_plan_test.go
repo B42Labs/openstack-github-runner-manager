@@ -295,3 +295,73 @@ func TestPlanReconcileIgnoresUnnumberedNames(t *testing.T) {
 		t.Errorf("the unnumbered server must be ignored, leaving a no-op: %+v", plan)
 	}
 }
+
+// TestPlanReplaceRebuildsAHealthyInstance proves the rolling-update plan: the
+// instance at the index is replaced whatever its status, its boot volume goes
+// with it (never reused), the same index is created again, and nothing else in
+// the fleet is touched.
+func TestPlanReplaceRebuildsAHealthyInstance(t *testing.T) {
+	current := fullInfra()
+	current.Servers = serverRefs(1, 2, 3)
+	current.VolumeRefs = volumeRefs(1, 2, 3)
+
+	plan := PlanReplace(current, testNames, 2)
+
+	if plan.NeedNetwork || plan.NeedSubnet || plan.NeedRouter || plan.NeedKeypair {
+		t.Errorf("existing infra and keypair must be reused: %+v", plan)
+	}
+	if want := []int{2}; !reflect.DeepEqual(plan.InstancesToCreate, want) {
+		t.Errorf("InstancesToCreate = %v; want %v", plan.InstancesToCreate, want)
+	}
+	if got := indexNames(plan.InstancesToReplace); !reflect.DeepEqual(got, []string{testNames.Server(2)}) {
+		t.Errorf("InstancesToReplace = %v; want only 002", got)
+	}
+	if got := volNames(plan.VolumesToReplace); !reflect.DeepEqual(got, []string{testNames.Volume(2)}) {
+		t.Errorf("VolumesToReplace = %v; want only 002's volume", got)
+	}
+	if len(plan.OrphanBootVolumes) != 0 {
+		t.Errorf("a replacement must never reuse a volume: %v", plan.OrphanBootVolumes)
+	}
+	if len(plan.InstancesToDelete) != 0 || len(plan.VolumesToDelete) != 0 {
+		t.Errorf("a replacement touches no other instance: %+v", plan)
+	}
+	if !plan.HasWork() {
+		t.Error("a replacement is work")
+	}
+}
+
+// An index whose instance is already gone (an update that died between the
+// delete and the rebuild) is created again, and a volume left under the name
+// is deleted rather than reused so the rebuild starts from the fresh image.
+func TestPlanReplaceFinishesAnInterruptedReplacement(t *testing.T) {
+	current := fullInfra()
+	current.Servers = serverRefs(1, 3)
+	current.VolumeRefs = volumeRefs(1, 2, 3)
+
+	plan := PlanReplace(current, testNames, 2)
+
+	if want := []int{2}; !reflect.DeepEqual(plan.InstancesToCreate, want) {
+		t.Errorf("InstancesToCreate = %v; want %v", plan.InstancesToCreate, want)
+	}
+	if len(plan.InstancesToReplace) != 0 {
+		t.Errorf("no server to replace: %v", indexNames(plan.InstancesToReplace))
+	}
+	if got := volNames(plan.VolumesToReplace); !reflect.DeepEqual(got, []string{testNames.Volume(2)}) {
+		t.Errorf("VolumesToReplace = %v; want the leftover volume", got)
+	}
+	if len(plan.OrphanBootVolumes) != 0 {
+		t.Errorf("the leftover volume must be deleted, not reused: %v", plan.OrphanBootVolumes)
+	}
+}
+
+// A keypair the cloud lost is created again, exactly as create would, since
+// the rebuilt instance is booted with it.
+func TestPlanReplaceRecreatesAMissingKeypair(t *testing.T) {
+	current := fullInfra()
+	current.KeypairExists = false
+	current.Servers = serverRefs(1)
+
+	if plan := PlanReplace(current, testNames, 1); !plan.NeedKeypair {
+		t.Error("a missing keypair must be recreated for the rebuilt instance")
+	}
+}

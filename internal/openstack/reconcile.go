@@ -81,9 +81,9 @@ func (m *Manager) Reconcile(ctx context.Context, current *Fleet, plan ReconcileP
 		return fleet, err
 	}
 
-	// Tear down any instance discovered in ERROR (and its boot volume) before
+	// Tear down every instance the plan replaces (and its boot volume) before
 	// the create phase rebuilds its index from scratch.
-	if err := m.replaceBrokenInstances(ctx, plan); err != nil {
+	if err := m.replaceInstances(ctx, plan); err != nil {
 		return fleet, err
 	}
 
@@ -276,9 +276,10 @@ func (m *Manager) createInstances(ctx context.Context, plan ReconcilePlan, spec 
 			// Tags travel in the create call, so an instance is never visible
 			// untagged. This is what the compute client's 2.52 microversion buys.
 			Tags: labels.ForIndex(spec.Names.Fleet, spec.Names.Project, labels.RoleServer, idx).Tags(),
-			// The repository rides along as metadata instead: a URL does not fit
-			// the tag limit. `delete` reads it back to deregister the runner.
-			Metadata: repoMetadata(spec.RepoURL),
+			// The repository and the runner labels ride along as metadata
+			// instead: neither fits the tag limit. `delete` reads the repository
+			// back to deregister the runner, `update` reads both to rebuild it.
+			Metadata: serverMetadata(spec.RepoURL, spec.Labels),
 			BlockDevice: []servers.BlockDevice{{
 				BootIndex:           0,
 				UUID:                volID,
@@ -297,14 +298,21 @@ func (m *Manager) createInstances(ctx context.Context, plan ReconcilePlan, spec 
 	return nil
 }
 
-// repoMetadata renders the server metadata that records where an instance's
-// runner registers. An unknown repository records nothing: an empty value would
-// read back the same as no value at all.
-func repoMetadata(repoURL string) map[string]string {
-	if repoURL == "" {
+// serverMetadata renders the server metadata that records where an instance's
+// runner registers and which extra labels it carries. An unknown value records
+// nothing: an empty value would read back the same as no value at all.
+func serverMetadata(repoURL, runnerLabels string) map[string]string {
+	md := map[string]string{}
+	if repoURL != "" {
+		md[labels.KeyRepo] = repoURL
+	}
+	if runnerLabels != "" {
+		md[labels.KeyLabels] = runnerLabels
+	}
+	if len(md) == 0 {
 		return nil
 	}
-	return map[string]string{labels.KeyRepo: repoURL}
+	return md
 }
 
 // ensureBootVolume returns the ID of the boot volume for the given instance
@@ -361,26 +369,27 @@ func (m *Manager) deleteInstances(ctx context.Context, plan ReconcilePlan) error
 	return m.deleteServersAndVolumes(ctx, "surplus", plan.InstancesToDelete, plan.VolumesToDelete)
 }
 
-// replaceBrokenInstances tears down the instances the plan found in ERROR,
+// replaceInstances tears down the instances the plan replaces — the ones
+// PlanReconcile found in ERROR, or the healthy one a rolling update rebuilds —
 // together with their boot volumes, so the create phase that follows rebuilds
-// each freed index from a fresh volume instead of colliding with the failed
-// server that still holds the name. It runs before createInstances precisely
-// because a replacement reuses the same index, so the old instance must be gone
-// first — the opposite ordering from the surplus delete, which runs after the
-// create to avoid dipping below capacity.
-func (m *Manager) replaceBrokenInstances(ctx context.Context, plan ReconcilePlan) error {
+// each freed index from a fresh volume instead of colliding with the server
+// that still holds the name. It runs before createInstances precisely because
+// a replacement reuses the same index, so the old instance must be gone first
+// — the opposite ordering from the surplus delete, which runs after the create
+// to avoid dipping below capacity.
+func (m *Manager) replaceInstances(ctx context.Context, plan ReconcilePlan) error {
 	if len(plan.InstancesToReplace) == 0 && len(plan.VolumesToReplace) == 0 {
 		return nil
 	}
-	return m.deleteServersAndVolumes(ctx, "broken", plan.InstancesToReplace, plan.VolumesToReplace)
+	return m.deleteServersAndVolumes(ctx, "outgoing", plan.InstancesToReplace, plan.VolumesToReplace)
 }
 
 // deleteServersAndVolumes tears down the given instances and then their boot
 // volumes. It mirrors the teardown sequence — delete each server, wait for it
 // to disappear so its boot volume detaches, then wait for each volume to become
 // deletable (or vanish via delete_on_termination) before deleting it. kind is a
-// one-word descriptor ("surplus", "broken") woven into the progress log so the
-// operator can tell a scale-down sweep from a broken-instance replacement.
+// one-word descriptor ("surplus", "outgoing") woven into the progress log so the
+// operator can tell a scale-down sweep from a replacement.
 // Errors are collected and joined so one stubborn resource does not abort the
 // rest of the sweep.
 func (m *Manager) deleteServersAndVolumes(ctx context.Context, kind string, srvs []ServerRef, vols []ResourceRef) error {

@@ -46,6 +46,13 @@ const (
 // metadata alone.
 const KeyRepo = "ogrm:repo"
 
+// KeyLabels records the extra runner labels an instance was created with
+// (the -labels flag, verbatim), so `update` can rebuild the instance with the
+// same labels without being told them again. Like KeyRepo it is nova server
+// metadata: a label list is free-form and easily longer than a tag allows. An
+// instance created without extra labels records nothing.
+const KeyLabels = "ogrm:labels"
+
 // Role is the kind of resource a label set describes. It is the one label that
 // differs between the resources of a single cluster.
 type Role string

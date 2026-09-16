@@ -315,7 +315,22 @@ func (c *Clients) listServers(ctx context.Context, opts servers.ListOpts, keep f
 // the repository its runner registered against, which `delete` needs to
 // deregister that runner.
 func serverRef(s servers.Server) ServerRef {
-	return ServerRef{ID: s.ID, Name: s.Name, Status: s.Status, RepoURL: s.Metadata[labels.KeyRepo]}
+	return ServerRef{
+		ID: s.ID, Name: s.Name, Status: s.Status,
+		RepoURL:          s.Metadata[labels.KeyRepo],
+		Labels:           s.Metadata[labels.KeyLabels],
+		Flavor:           flavorName(s),
+		AvailabilityZone: s.AvailabilityZone,
+	}
+}
+
+// flavorName returns the name of the flavor a server runs on. Nova embeds the
+// flavor's original_name in the server document from microversion 2.47 on,
+// which the 2.52 this tool requires includes; an older document carries only
+// the id, and then no name is known.
+func flavorName(s servers.Server) string {
+	name, _ := s.Flavor["original_name"].(string)
+	return name
 }
 
 // serverTags returns a server's tags. Nova omits the field entirely below
@@ -351,7 +366,10 @@ func (c *Clients) volumesForCluster(ctx context.Context, names naming.Scheme) ([
 	for _, v := range all {
 		labelled := labels.MapMatches(v.Metadata, want)
 		if labelled || strings.HasPrefix(v.Name, prefix) {
-			out = append(out, ResourceRef{ID: v.ID, Name: v.Name, Labelled: labelled})
+			out = append(out, ResourceRef{
+				ID: v.ID, Name: v.Name, Labelled: labelled,
+				Size: v.Size, VolumeType: v.VolumeType, ImageName: v.VolumeImageMetadata["image_name"],
+			})
 		}
 	}
 	sortRefs(out)

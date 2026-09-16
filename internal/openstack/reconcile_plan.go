@@ -143,6 +143,43 @@ func PlanReconcile(current *Fleet, names naming.Scheme, desiredCount int) Reconc
 	return p
 }
 
+// PlanReplace computes the plan that rebuilds one instance in place: the
+// discovered server at index idx is torn down together with its boot volume,
+// and the same index is created again from a fresh volume. It is what a rolling
+// update executes per instance once that instance's runner is idle.
+//
+// Unlike PlanReconcile it does not care whether the instance is healthy — a
+// running ACTIVE instance is replaced just like one in ERROR — and it never
+// reuses a leftover boot volume for the index: the point of the replacement is
+// a fresh image, so any volume already carrying the name is deleted first. An
+// index with no server at all still yields a create, so an update that died
+// between the delete and the create is finished by running it again.
+//
+// Shared infrastructure is reported through the Need* fields exactly as
+// PlanReconcile does; the caller decides whether a missing piece is acceptable.
+// The keypair is created when absent, as any create of an instance would.
+func PlanReplace(current *Fleet, names naming.Scheme, idx int) ReconcilePlan {
+	p := ReconcilePlan{
+		NeedNetwork:       current.NetworkID == "",
+		NeedSubnet:        current.SubnetID == "",
+		NeedRouter:        current.RouterID == "",
+		NeedKeypair:       !current.KeypairExists,
+		InstancesToCreate: []int{idx},
+		OrphanBootVolumes: map[int]ResourceRef{},
+	}
+	for _, s := range current.Servers {
+		if i, ok := names.IndexOf(s.Name); ok && i == idx {
+			p.InstancesToReplace = append(p.InstancesToReplace, s)
+		}
+	}
+	for _, v := range current.VolumeRefs {
+		if i, ok := names.IndexOf(v.Name); ok && i == idx {
+			p.VolumesToReplace = append(p.VolumesToReplace, v)
+		}
+	}
+	return p
+}
+
 // HasWork reports whether the plan changes anything. A false result means the
 // observed state already matches the desired count and every shared resource
 // is present, so the reconcile is a no-op.
