@@ -85,6 +85,30 @@ kernel present under `/lib/modules` rather than just the running one — cloud-i
 upgrades the kernel *before* `install.sh` runs and reboots *after* it, so the
 kernel that will actually run jobs is not the one `uname -r` reports here.
 
+### IPv4 only
+
+The runner subnet is created as IPv4-only, so an instance never has a working
+IPv6 path to the outside. It can still end up *holding* an IPv6 address with a
+route — systemd-networkd accepts any Router Advertisement it sees, and the
+Docker network kind creates puts a ULA on the host — and as soon as it does,
+Go (dockerd, BuildKit, kind, `go mod download`) and glibc both dial the IPv6
+address of anything that publishes AAAA records first. Go then reports that
+family's error even when the IPv4 fallback is what actually failed, so jobs
+die with messages like
+
+```
+dial tcp [2a00:1450:400c:c07::52]:443: connect: network is unreachable
+```
+
+`install.sh` therefore writes `/etc/sysctl.d/99-ogrm-ipv4.conf`, which disables
+IPv6 on every host interface except loopback and refuses Router Advertisements
+on the interfaces Docker turns IPv6 back on (its own bridges). Docker manages
+IPv6 inside its networks and containers itself, so kind's dual-stack bridge
+network is unaffected, and `::1` stays for anything that binds localhost over
+IPv6. Should a deployment ever get a routed IPv6 subnet, delete that file on
+the instances (or drop the block from `install.sh`) and IPv6 comes back after
+`sysctl --system`.
+
 Everything a workflow pins itself stays the workflow's job: Go comes from
 `actions/setup-go`, Node from `actions/setup-node`, and version-pinned test
 tooling (chainsaw, flux, a specific kubectl) from the repository's own install

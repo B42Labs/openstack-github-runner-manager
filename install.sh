@@ -13,6 +13,8 @@
 #     cloud image does not (git, python3, shellcheck, the archive formats)
 #   - KinD-relevant kernel limits (inotify) and the chaos-mesh NetworkChaos
 #     kernel modules, both set persistently
+#   - IPv4 only on the host's interfaces: the runner subnet has no IPv6, so a
+#     stray IPv6 address would only make Go and glibc dial dead addresses first
 #   - A disk guard that reclaims space between jobs, so the runner does not
 #     fill its filesystem with leftover KinD clusters and Docker layers
 #   - Runner installed as a systemd service running as user "ubuntu"
@@ -275,6 +277,36 @@ echo "==> Setting inotify limits for KinD ..."
 cat > /etc/sysctl.d/99-kind.conf <<'EOF'
 fs.inotify.max_user_watches = 524288
 fs.inotify.max_user_instances = 512
+EOF
+
+# The runner's subnet is IPv4-only (ogrm creates it with ip_version 4), so an
+# instance never has a usable IPv6 path to the outside - yet jobs kept dying
+# on registries and module proxies that publish AAAA records:
+#
+#   dial tcp [2a00:1450:400c:c07::52]:443: connect: network is unreachable
+#
+# Go, which dockerd, BuildKit, kind and `go mod download` are all written in,
+# and glibc both prefer an IPv6 destination over an IPv4 one as soon as the
+# host holds a global IPv6 address with a route - and Go reports the error of
+# that first family even after the IPv4 fallback also failed, so the log
+# names IPv6 whatever went wrong. The tenant network sends no Router
+# Advertisements of its own, but systemd-networkd accepts any RA it sees in
+# userspace, regardless of the kernel's accept_ra, and a Docker network with
+# IPv6 (kind creates one) puts a ULA on the host too. Rather than chase each
+# source, take IPv6 off every host interface but loopback, and refuse RAs on
+# the interfaces Docker re-enables it on (its own bridges). Docker manages
+# IPv6 inside its networks and containers itself, so kind's dual-stack bridge
+# keeps working; ::1 stays for anything that binds localhost over IPv6.
+#
+# One file, in this order: `all` also flips lo, so lo is put back afterwards;
+# `default` covers every interface created later (Docker bridges, veths).
+echo "==> Preferring IPv4: disabling IPv6 on the host's interfaces (loopback stays) ..."
+cat > /etc/sysctl.d/99-ogrm-ipv4.conf <<'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 0
+net.ipv6.conf.all.accept_ra = 0
+net.ipv6.conf.default.accept_ra = 0
 EOF
 sysctl --system >/dev/null
 
