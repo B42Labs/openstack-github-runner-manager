@@ -35,7 +35,7 @@ const (
 
 // Disk guard defaults. A KinD runner's boot volume fills from leftover
 // clusters, images, and build cache, so every instance gets an on-instance
-// guard that reclaims between jobs (see install.sh section 9).
+// guard that reclaims between jobs (see install.sh section 11).
 //
 // The threshold is where the guard stops being gentle and starts throwing away
 // caches the next job would have reused: 80% of a 100 GiB volume still leaves

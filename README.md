@@ -85,29 +85,37 @@ kernel present under `/lib/modules` rather than just the running one — cloud-i
 upgrades the kernel *before* `install.sh` runs and reboots *after* it, so the
 kernel that will actually run jobs is not the one `uname -r` reports here.
 
-### IPv4 only
+### DNS that survives a lost packet
 
-The runner subnet is created as IPv4-only, so an instance never has a working
-IPv6 path to the outside. It can still end up *holding* an IPv6 address with a
-route — systemd-networkd accepts any Router Advertisement it sees, and the
-Docker network kind creates puts a ULA on the host — and as soon as it does,
-Go (dockerd, BuildKit, kind, `go mod download`) and glibc both dial the IPv6
-address of anything that publishes AAAA records first. Go then reports that
-family's error even when the IPv4 fallback is what actually failed, so jobs
-die with messages like
+The runner subnet is IPv4-only, yet jobs kept dying on registries and module
+proxies with
 
 ```
 dial tcp [2a00:1450:400c:c07::52]:443: connect: network is unreachable
 ```
 
-`install.sh` therefore writes `/etc/sysctl.d/99-ogrm-ipv4.conf`, which disables
-IPv6 on every host interface except loopback and refuses Router Advertisements
-on the interfaces Docker turns IPv6 back on (its own bridges). Docker manages
-IPv6 inside its networks and containers itself, so kind's dual-stack bridge
-network is unaffected, and `::1` stays for anything that binds localhost over
-IPv6. Should a deployment ever get a routed IPv6 subnet, delete that file on
-the instances (or drop the block from `install.sh`) and IPv6 comes back after
-`sysctl --system`.
+That is not an IPv6 problem, although it reads like one. Go (dockerd,
+BuildKit, kind, `go mod download`) resolves a name by sending the A and the
+AAAA query in parallel, each with its own timeout, and dials whatever came
+back. When the A reply is lost to packet loss on the egress path and the AAAA
+reply is not, the job dials the IPv6 address and fails exactly like this, about
+ten seconds after the lookup began, on a host that has no IPv6 route and was
+never going to use one. The failures cluster across runners of different
+deployments within seconds, which is the shared egress path dropping UDP under
+load, not any one host. Disabling IPv6 on the host changes nothing: the dial
+fails identically, and systemd-networkd re-enables IPv6 on the links it manages
+regardless of `net.ipv6.conf.*` anyway.
+
+`install.sh` therefore configures systemd-resolved
+(`/etc/systemd/resolved.conf.d/99-ogrm-dns.conf`) to send upstream queries
+over TLS (`DNSOverTLS=opportunistic`) and to keep expired records usable while
+the upstream is unreachable (`StaleRetentionSec=1h`). TLS means TCP: a lost
+segment is retransmitted within a fraction of a second instead of after a
+five-second DNS timeout, both queries share one connection, and the router's
+NAT no longer sees a flood of short-lived UDP flows. `opportunistic` falls back
+to plain DNS for a resolver without TLS; the default nameservers (Quad9) and
+Cloudflare and Google all offer it. The stale cache keeps a name that resolved
+once resolving, with both record types, through a hiccup.
 
 Everything a workflow pins itself stays the workflow's job: Go comes from
 `actions/setup-go`, Node from `actions/setup-node`, and version-pinned test

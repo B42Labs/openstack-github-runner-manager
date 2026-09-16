@@ -13,8 +13,9 @@
 #     cloud image does not (git, python3, shellcheck, the archive formats)
 #   - KinD-relevant kernel limits (inotify) and the chaos-mesh NetworkChaos
 #     kernel modules, both set persistently
-#   - IPv4 only on the host's interfaces: the runner subnet has no IPv6, so a
-#     stray IPv6 address would only make Go and glibc dial dead addresses first
+#   - DNS resolution that survives a lost packet: upstream queries over TLS and
+#     a stale cache, so a job never ends up with an AAAA-only answer on a host
+#     that has no IPv6 path (see section 8)
 #   - A disk guard that reclaims space between jobs, so the runner does not
 #     fill its filesystem with leftover KinD clusters and Docker layers
 #   - Runner installed as a systemd service running as user "ubuntu"
@@ -279,36 +280,44 @@ fs.inotify.max_user_watches = 524288
 fs.inotify.max_user_instances = 512
 EOF
 
-# The runner's subnet is IPv4-only (ogrm creates it with ip_version 4), so an
-# instance never has a usable IPv6 path to the outside - yet jobs kept dying
-# on registries and module proxies that publish AAAA records:
+# --- 8) DNS that survives a lost packet ---------------------------------------
+# Jobs kept dying on registries and module proxies with
 #
 #   dial tcp [2a00:1450:400c:c07::52]:443: connect: network is unreachable
 #
-# Go, which dockerd, BuildKit, kind and `go mod download` are all written in,
-# and glibc both prefer an IPv6 destination over an IPv4 one as soon as the
-# host holds a global IPv6 address with a route - and Go reports the error of
-# that first family even after the IPv4 fallback also failed, so the log
-# names IPv6 whatever went wrong. The tenant network sends no Router
-# Advertisements of its own, but systemd-networkd accepts any RA it sees in
-# userspace, regardless of the kernel's accept_ra, and a Docker network with
-# IPv6 (kind creates one) puts a ULA on the host too. Rather than chase each
-# source, take IPv6 off every host interface but loopback, and refuse RAs on
-# the interfaces Docker re-enables it on (its own bridges). Docker manages
-# IPv6 inside its networks and containers itself, so kind's dual-stack bridge
-# keeps working; ::1 stays for anything that binds localhost over IPv6.
+# which reads like an IPv6 problem and is not one: the runner subnet is
+# IPv4-only, so an IPv6 dial always fails that way - the question is why a
+# job dialled IPv6 at all. Go (dockerd, BuildKit, kind, `go mod download`)
+# resolves a name by sending the A and the AAAA query in parallel, each with
+# its own 5 s timeout and two attempts, and dials whatever came back. Lose the
+# A reply to upstream packet loss and the AAAA reply alone decides: the job
+# dials the IPv6 address and dies 10 s after the lookup began, on a host that
+# was never going to use IPv6. Lose the AAAA reply instead and nothing is
+# visible. The failures cluster across runners within seconds, which is the
+# egress path dropping UDP under load, not any one host.
 #
-# One file, in this order: `all` also flips lo, so lo is put back afterwards;
-# `default` covers every interface created later (Docker bridges, veths).
-echo "==> Preferring IPv4: disabling IPv6 on the host's interfaces (loopback stays) ..."
-cat > /etc/sysctl.d/99-ogrm-ipv4.conf <<'EOF'
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 0
-net.ipv6.conf.all.accept_ra = 0
-net.ipv6.conf.default.accept_ra = 0
+# Two settings on systemd-resolved take the asymmetry away. Upstream queries
+# go over TLS, i.e. TCP: a lost segment is retransmitted by the transport in
+# a fraction of a second instead of after a 5 s DNS timeout, one connection
+# carries both queries, and the flood of short-lived UDP flows through the
+# router's NAT is gone. `opportunistic` falls back to plain DNS for a server
+# that does not offer TLS (Quad9, Cloudflare and Google all do). And expired
+# records stay usable for an hour while the upstream is unreachable, so a
+# name that resolved once keeps resolving - with both record types - through
+# a hiccup instead of coming back half-answered.
+#
+# Note on IPv6 itself: a sysctl that disables it on the host does not touch
+# this - the dial fails identically with IPv6 off - and systemd-networkd
+# re-enables IPv6 on the links it manages regardless of net.ipv6.conf.*.
+echo "==> Hardening DNS resolution: upstream over TLS, stale cache while the upstream is unreachable ..."
+install -d -m 0755 /etc/systemd/resolved.conf.d
+cat > /etc/systemd/resolved.conf.d/99-ogrm-dns.conf <<'EOF'
+[Resolve]
+DNSOverTLS=opportunistic
+StaleRetentionSec=1h
 EOF
-sysctl --system >/dev/null
+rm -f /etc/sysctl.d/99-ogrm-ipv4.conf
+systemctl restart systemd-resolved
 
 # chaos-mesh's NetworkChaos enters the target pod's network namespace and drives
 # ipset/iptables/tc there. KinD nodes share this host's kernel, so the modules
@@ -356,12 +365,12 @@ for mod in "${CHAOS_MODULES[@]}"; do
     || echo "    WARNING: modprobe ${mod} failed; NetworkChaos suites may fail."
 done
 
-# --- 8) Cap the journal growth ------------------------------------------------
+# --- 9) Cap the journal growth -------------------------------------------------
 # A long-lived runner fills its disk from three directions: container logs that
 # grow without any bound, the systemd journal, and the Docker/KinD state a job
 # leaves behind. The first is capped with the rest of the daemon config in
 # section 2, because dockerd has only one config file to write; the journal is
-# bounded here; the third is what the disk guard in section 10 reclaims.
+# bounded here; the third is what the disk guard in section 11 reclaims.
 if [[ "${DISK_GUARD_ENABLED}" == "true" ]]; then
   echo "==> Capping journal growth ..."
 
@@ -375,7 +384,7 @@ CONF
   systemctl restart systemd-journald
 fi
 
-# --- 9) Set up the GitHub Actions runner --------------------------------------
+# --- 10) Set up the GitHub Actions runner -------------------------------------
 echo "==> Installing GitHub Actions runner ..."
 
 # Determine the latest runner version
@@ -416,7 +425,7 @@ else
   "
 fi
 
-# --- 10) Disk guard -----------------------------------------------------------
+# --- 11) Disk guard ------------------------------------------------------------
 # A self-hosted runner fills up because nothing between two jobs removes what
 # the previous one left behind: KinD clusters that outlived their job, every
 # image pulled or built, the BuildKit cache, and the runner's own _work tree.
@@ -722,7 +731,7 @@ EOF
   systemctl enable --now ogrm-disk-guard.timer
 fi
 
-# --- 11) Install as a systemd service (runs as ${RUNNER_USER}) ----------------
+# --- 12) Install as a systemd service (runs as ${RUNNER_USER}) ----------------
 echo "==> Installing runner as a systemd service ..."
 cd "${RUNNER_DIR}"
 ./svc.sh install "${RUNNER_USER}"
