@@ -12,6 +12,8 @@ github.com/gophercloud/utils/v2 v2.0.0-20260424064311-2eeed4ceb3e9 h1:WEPhYFzYmp
 github.com/gophercloud/utils/v2 v2.0.0-20260424064311-2eeed4ceb3e9/go.mod h1:bIEH+wgvnxfegUewFuGi0u/L+ji5uiEuVVQMNKQASEY=
 github.com/gophercloud/utils/v2 v2.0.0-20260824073324-42b9474d09d4 h1:VKbePn/0e1cg6HSvVB5CKeXpVcKmD2AuMk6WQhjexuI=
 github.com/gophercloud/utils/v2 v2.0.0-20260824073324-42b9474d09d4/go.mod h1:z+yO4g4N0u8rJuWNPVcjZHVAlzAFapFNnMOtFIpqddM=
+github.com/gophercloud/utils/v2 v2.0.0-20260922174841-b4759ea0529b h1:G2KBa3ku8mEUcjMRuJx7iSxWlX98uewBEPd9GXo3+tM=
+github.com/gophercloud/utils/v2 v2.0.0-20260922174841-b4759ea0529b/go.mod h1:lRwTjtOLb5RKkrSVZDvHoxYbzcIs5fO89Ll2CDCuwic=
 golang.org/x/sys v0.46.0 h1:noSf2Fq6F8DBgS+LysIkx7rIExoNHJsxOAtPp4rthXw=
 golang.org/x/sys v0.46.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
 golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
