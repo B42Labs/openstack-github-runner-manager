@@ -180,6 +180,37 @@ func PlanReplace(current *Fleet, names naming.Scheme, idx int) ReconcilePlan {
 	return p
 }
 
+// PlanRemove computes the plan that deletes the instances at the given
+// indices together with their boot volumes, and nothing else: no shared
+// resource is created or removed, no index is created, and every other
+// instance stays. It is what `delete -only` executes. Both lists are ordered
+// highest index first, as a scale-down removes them; an index with neither a
+// server nor a volume contributes nothing, so a run that names an instance
+// which is already gone is a no-op on the cloud side rather than an error.
+func PlanRemove(current *Fleet, names naming.Scheme, idxs []int) ReconcilePlan {
+	wanted := map[int]bool{}
+	for _, idx := range idxs {
+		wanted[idx] = true
+	}
+	servers := map[int]ServerRef{}
+	for _, s := range current.Servers {
+		if idx, ok := names.IndexOf(s.Name); ok && wanted[idx] {
+			servers[idx] = s
+		}
+	}
+	volumes := map[int]ResourceRef{}
+	for _, v := range current.VolumeRefs {
+		if idx, ok := names.IndexOf(v.Name); ok && wanted[idx] {
+			volumes[idx] = v
+		}
+	}
+	return ReconcilePlan{
+		InstancesToDelete: surplusServers(servers, 0),
+		VolumesToDelete:   surplusVolumes(volumes, 0),
+		OrphanBootVolumes: map[int]ResourceRef{},
+	}
+}
+
 // HasWork reports whether the plan changes anything. A false result means the
 // observed state already matches the desired count and every shared resource
 // is present, so the reconcile is a no-op.

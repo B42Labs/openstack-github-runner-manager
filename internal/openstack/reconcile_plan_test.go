@@ -354,6 +354,34 @@ func TestPlanReplaceFinishesAnInterruptedReplacement(t *testing.T) {
 	}
 }
 
+// TestPlanRemoveDeletesOnlyTheNamedInstances proves the -only delete plan:
+// the named instances and their boot volumes go, highest first, an index with
+// nothing under it contributes nothing, and nothing is created or repaired.
+func TestPlanRemoveDeletesOnlyTheNamedInstances(t *testing.T) {
+	current := &Fleet{} // no shared infra, so a plan that wanted to repair it would show
+	current.Servers = serverRefs(1, 2, 3, 4)
+	current.VolumeRefs = volumeRefs(1, 2, 4, 5)
+
+	plan := PlanRemove(current, testNames, []int{2, 4, 5, 7})
+
+	if got, want := indexNames(plan.InstancesToDelete), []string{testNames.Server(4), testNames.Server(2)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("InstancesToDelete = %v; want %v", got, want)
+	}
+	if got, want := volNames(plan.VolumesToDelete), []string{testNames.Volume(5), testNames.Volume(4), testNames.Volume(2)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("VolumesToDelete = %v; want %v", got, want)
+	}
+	if plan.NeedNetwork || plan.NeedSubnet || plan.NeedRouter || plan.NeedKeypair ||
+		len(plan.InstancesToCreate) != 0 || len(plan.InstancesToReplace) != 0 || len(plan.VolumesToReplace) != 0 || len(plan.OrphanBootVolumes) != 0 {
+		t.Errorf("a removal deletes and does nothing else: %+v", plan)
+	}
+	if !plan.HasWork() {
+		t.Error("a removal is work")
+	}
+	if plan := PlanRemove(current, testNames, []int{7}); plan.HasWork() {
+		t.Errorf("an index with nothing under it is a no-op: %+v", plan)
+	}
+}
+
 // A keypair the cloud lost is created again, exactly as create would, since
 // the rebuilt instance is booted with it.
 func TestPlanReplaceRecreatesAMissingKeypair(t *testing.T) {

@@ -92,7 +92,8 @@ Commands:
             runner is idle, deregister it, delete the instance, and create
             it again under the same name from a fresh image.
   delete    Delete every resource owned by a deployment and deregister
-            its runners from GitHub.
+            its runners from GitHub; with -only, delete just the named
+            instances and leave the rest of the deployment in place.
   version   Print version information.
   help      Show this help.
 

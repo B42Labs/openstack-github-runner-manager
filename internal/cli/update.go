@@ -594,11 +594,7 @@ func shapeSummary(cfg config.Config) string {
 // resumeHint tells the operator how to finish an update that stopped part way
 // through: the instance it stopped on plus every one after it.
 func resumeHint(name string, remaining []int) string {
-	parts := make([]string, len(remaining))
-	for i, idx := range remaining {
-		parts[i] = strconv.Itoa(idx)
-	}
-	return fmt.Sprintf("re-run `update -name %s -only %s` to finish the remaining instance(s)", name, strings.Join(parts, ","))
+	return fmt.Sprintf("re-run `update -name %s -only %s` to finish the remaining instance(s)", name, joinCounters(remaining))
 }
 
 // sleepCtx waits for d or until ctx is cancelled, whichever comes first.

@@ -34,6 +34,17 @@ func (f *fakeDeleter) Teardown(context.Context, naming.Scheme) error {
 	return nil
 }
 
+// Remove logs each instance and volume the plan deletes, in plan order.
+func (f *fakeDeleter) Remove(_ context.Context, plan openstack.ReconcilePlan) error {
+	for _, s := range plan.InstancesToDelete {
+		*f.events = append(*f.events, "remove "+s.Name)
+	}
+	for _, v := range plan.VolumesToDelete {
+		*f.events = append(*f.events, "remove "+v.Name)
+	}
+	return nil
+}
+
 // fakeRegistry stands in for GitHub: it serves canned runners per repository,
 // records which repositories were asked, and writes every deregistration to the
 // shared event log.
@@ -315,6 +326,131 @@ func TestDeleteAbortOnDeclinedConfirmation(t *testing.T) {
 	}
 	if !strings.Contains(out, "Aborted") {
 		t.Errorf("declined run should report it aborted:\n%s", out)
+	}
+}
+
+// TestDeleteOnlyRemovesJustThoseInstances proves the -only path: exactly the
+// named instance and its boot volume are deleted, exactly its runner is
+// deregistered, after the cloud side, and the teardown that would take the
+// network and the other instances with it never runs.
+func TestDeleteOnlyRemovesJustThoseInstances(t *testing.T) {
+	mgr, gh, events := deleteFixture(recordedFleet(itRepo, 1, 2, 3), map[string][]github.Runner{itRepo: {
+		{ID: 11, Name: itNames.Server(1), Status: "online"},
+		{ID: 12, Name: itNames.Server(2), Status: "online"},
+		{ID: 13, Name: itNames.Server(3), Status: "online"},
+	}})
+	f := baseDeleteFlags()
+	f.only = []int{2}
+
+	out, err := runDeleteWith(f, mgr, gh, "")
+	if err != nil {
+		t.Fatalf("deleteWith: %v", err)
+	}
+
+	want := []string{
+		"remove " + itNames.Server(2),
+		"remove " + itNames.Volume(2),
+		"deregister " + itRepo + " 12",
+	}
+	if !reflect.DeepEqual(*events, want) {
+		t.Errorf("events = %v; want %v", *events, want)
+	}
+	for _, s := range []string{itNames.Server(2), "every other instance stay", "Deleted " + itNames.Server(2), "-only 2"} {
+		if !strings.Contains(out, s) {
+			t.Errorf("output missing %q:\n%s", s, out)
+		}
+	}
+	for _, spared := range []string{itNames.Server(1), itNames.Server(3)} {
+		if strings.Contains(out, spared+"  ") {
+			t.Errorf("preview lists instance %q, which -only 2 must not touch:\n%s", spared, out)
+		}
+	}
+}
+
+// A runner whose instance is already gone (an earlier -only delete that could
+// not deregister it, or a scale-down) is still swept by naming its counter; the
+// repository comes from the instances that remain.
+func TestDeleteOnlyDeregistersARunnerWhoseInstanceIsGone(t *testing.T) {
+	mgr, gh, events := deleteFixture(recordedFleet(itRepo, 1), map[string][]github.Runner{itRepo: {
+		{ID: 11, Name: itNames.Server(1), Status: "online"},
+		{ID: 12, Name: itNames.Server(2), Status: "offline"},
+	}})
+	f := baseDeleteFlags()
+	f.only = []int{2}
+
+	out, err := runDeleteWith(f, mgr, gh, "")
+	if err != nil {
+		t.Fatalf("deleteWith: %v", err)
+	}
+	if want := []string{"deregister " + itRepo + " 12"}; !reflect.DeepEqual(*events, want) {
+		t.Errorf("events = %v; want %v", *events, want)
+	}
+	if !strings.Contains(out, "nothing left in the cloud") {
+		t.Errorf("preview should say the instance is already gone:\n%s", out)
+	}
+}
+
+// -only with nothing under the counter, in the cloud or on GitHub, changes
+// nothing and says so; -keep-runners skips GitHub as for a whole delete.
+func TestDeleteOnlyNoOpAndKeepRunners(t *testing.T) {
+	mgr, gh, events := deleteFixture(recordedFleet(itRepo, 1), map[string][]github.Runner{itRepo: {
+		{ID: 11, Name: itNames.Server(1), Status: "online"},
+	}})
+	f := baseDeleteFlags()
+	f.only = []int{4}
+
+	out, err := runDeleteWith(f, mgr, gh, "")
+	if err != nil {
+		t.Fatalf("deleteWith: %v", err)
+	}
+	if len(*events) != 0 || !strings.Contains(out, "Nothing to delete") {
+		t.Errorf("events = %v, output:\n%s", *events, out)
+	}
+
+	mgr, gh, events = deleteFixture(recordedFleet(itRepo, 1, 2), map[string][]github.Runner{itRepo: {
+		{ID: 12, Name: itNames.Server(2), Status: "online"},
+	}})
+	f.only = []int{2}
+	f.keepRunners = true
+	if _, err := runDeleteWith(f, mgr, gh, ""); err != nil {
+		t.Fatalf("deleteWith: %v", err)
+	}
+	if len(gh.listed) != 0 {
+		t.Errorf("-keep-runners still asked GitHub about %v", gh.listed)
+	}
+	if want := []string{"remove " + itNames.Server(2), "remove " + itNames.Volume(2)}; !reflect.DeepEqual(*events, want) {
+		t.Errorf("events = %v; want %v", *events, want)
+	}
+}
+
+// A declined confirmation on the -only path deletes nothing either.
+func TestDeleteOnlyAbortOnDeclinedConfirmation(t *testing.T) {
+	mgr, gh, events := deleteFixture(recordedFleet(itRepo, 1, 2), map[string][]github.Runner{itRepo: {
+		{ID: 12, Name: itNames.Server(2), Status: "online"},
+	}})
+	f := baseDeleteFlags()
+	f.only = []int{2}
+	f.assumeYes = false
+
+	out, err := runDeleteWith(f, mgr, gh, "n\n")
+	if err != nil {
+		t.Fatalf("deleteWith: %v", err)
+	}
+	if len(*events) != 0 || !strings.Contains(out, "Aborted") {
+		t.Errorf("declining must delete nothing; events = %v, output:\n%s", *events, out)
+	}
+}
+
+func TestParseDeleteFlagsOnly(t *testing.T) {
+	f, err := parseDeleteFlags([]string{"-name", "acme", "-only", "3,002,ogrm-acme-001,3"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if want := []int{1, 2, 3}; !reflect.DeepEqual(f.only, want) {
+		t.Errorf("only = %v; want %v", f.only, want)
+	}
+	if _, err := parseDeleteFlags([]string{"-name", "acme", "-only", "two"}, io.Discard); err == nil {
+		t.Error("an -only entry that is neither a counter nor an instance name must be rejected")
 	}
 }
 
