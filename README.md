@@ -173,6 +173,11 @@ untouched.
 > contrast, [deregisters the runners](#delete) with the deployment, these
 > offline leftovers included.
 
+To take out one particular instance rather than the highest-numbered one, say
+`002` of five because its disk is full, use [`delete -only 2`](#delete): it
+removes that instance with its boot volume and deregisters its runner, and
+leaves the rest of the deployment running.
+
 ## Keeping the disk from filling up
 
 A self-hosted runner fills its disk because nothing between two jobs removes
@@ -551,6 +556,7 @@ bin/ogrm delete -name acme        # confirms first
 bin/ogrm delete -name acme -yes    # no prompt
 bin/ogrm delete -name acme -repo https://github.com/acme/example  # older deployment
 bin/ogrm delete -name acme -keep-runners                          # cloud side only
+bin/ogrm delete -name acme -only 2        # just ogrm-acme-002 and its runner; the rest stays
 ```
 
 `delete` discovers resources by their labels and their name prefix, then removes
@@ -584,9 +590,32 @@ cloud resources, so one confirmation covers both.
   `gh` cannot list them, `delete` stops with nothing deleted; pass
   `-keep-runners` to delete the cloud side only.
 
+#### Deleting single instances
+
+`delete -only 2,3` removes just the named instances instead of the whole
+deployment: each one's instance and boot volume are deleted and its runner is
+deregistered, in the same order as above, while the network, subnet, router,
+keypair, and every other instance stay exactly as they are. Counters take the
+same forms as for `update` (`2`, `002`, or `ogrm-acme-002`). The preview lists
+what is under each counter; a counter whose instance is already gone still
+sweeps a runner left registered under its name, and one with nothing anywhere
+is a no-op. `-repo` and `-keep-runners` apply as for a whole delete.
+
+Unlike a scale-down, which only ever removes from the top, `-only` leaves a gap
+in the numbering. The desired instance set of `create` is always `001..count`,
+so the next `create -name acme -count 5` rebuilds `002` from a fresh volume,
+which is also the way to bring the instance back; `update -name acme -only 2`
+does the same right away. A `create` whose `-count` is below the gap does not
+fill it, and removes every instance above the count as surplus, as always.
+
+The runner is not waited for: a job running on the instance dies with it,
+exactly as in a whole delete. To replace an instance without interrupting its
+job, use [`update`](#update), which waits until the runner is idle.
+
 | Flag            | Default                       | Meaning                                    |
 | --------------- | ----------------------------- | ------------------------------------------ |
 | `-name`         | *(required)*                  | deployment to delete                       |
+| `-only`         | *(the whole deployment)*      | comma-separated instance counters to delete instead (`2,3` or `002,003`); the rest of the deployment stays |
 | `-repo`         | *(recorded on the instances)* | GitHub repository to deregister the runners from |
 | `-keep-runners` | `false`                       | leave the runners registered with GitHub   |
 | `-prefix`       | `ogrm`                        | leading token the resources were created with |

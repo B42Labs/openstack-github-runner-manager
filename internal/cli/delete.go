@@ -11,6 +11,7 @@ import (
 	"io"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -28,15 +29,21 @@ type deleteFlags struct {
 	keepRunners bool
 	assumeYes   bool
 	connect     connectSettings
+
+	// only restricts the delete to these 1-based instance counters, ascending.
+	// Empty means the whole deployment, shared infrastructure included.
+	only []int
 }
 
 func parseDeleteFlags(args []string, out io.Writer) (*deleteFlags, error) {
 	f := &deleteFlags{}
+	var only string
 	fs := flag.NewFlagSet("delete", flag.ContinueOnError)
 	fs.SetOutput(out)
 	fs.StringVar(&f.name, "name", "", "deployment name (e.g. acme) whose <prefix>-<name>-... resources to delete (required)")
 	fs.StringVar(&f.prefix, "prefix", naming.DefaultFleetPrefix, "leading token the resources were named with (must match the create-time prefix)")
 	fs.StringVar(&f.cloud, "cloud", "", `clouds.yaml entry to use (default: OS_CLOUD / OS_* env, else "openstack")`)
+	fs.StringVar(&only, "only", "", "comma-separated instance counters to delete (e.g. 2,3 or 002,003) instead of the whole deployment; the other instances and the shared network stay")
 	fs.StringVar(&f.repo, "repo", "", "GitHub repository URL to deregister the runners from (default: the URL the instances recorded at create time)")
 	fs.BoolVar(&f.keepRunners, "keep-runners", false, "leave the deployment's runners registered with GitHub (default: deregister them via gh)")
 	fs.BoolVar(&f.assumeYes, "yes", false, "do not prompt for confirmation before deleting")
@@ -58,6 +65,11 @@ func parseDeleteFlags(args []string, out io.Writer) (*deleteFlags, error) {
 			return nil, err
 		}
 	}
+	idxs, err := parseOnly(only, naming.New(f.prefix, f.name))
+	if err != nil {
+		return nil, err
+	}
+	f.only = idxs
 	if err := f.connect.validate(); err != nil {
 		return nil, err
 	}
@@ -65,11 +77,13 @@ func parseDeleteFlags(args []string, out io.Writer) (*deleteFlags, error) {
 }
 
 // deleter is the slice of the OpenStack adapter the delete flow drives:
-// discover what the deployment owns, then remove it. Like reconciler for
-// create, it lets deleteWith run against a fake cloud.
+// discover what the deployment owns, then remove all of it (Teardown) or just
+// the instances a plan names (Remove). Like reconciler for create, it lets
+// deleteWith run against a fake cloud.
 type deleter interface {
 	List(ctx context.Context, names naming.Scheme) (*openstack.Fleet, error)
 	Teardown(ctx context.Context, names naming.Scheme) error
+	Remove(ctx context.Context, plan openstack.ReconcilePlan) error
 }
 
 // runnerRegistry is the slice of the GitHub client the delete flow drives: list
@@ -108,9 +122,14 @@ func runDelete(args []string, env *Env) error {
 
 // deleteWith previews everything the deployment owns, in the cloud and as
 // runners registered with GitHub, asks for confirmation, tears the cloud side
-// down, and then deregisters the runners. It is the cloud-agnostic core of the
+// down, and then deregisters the runners. With -only it previews and removes
+// just the named instances instead. It is the cloud-agnostic core of the
 // delete command, driven through the deleter and runnerRegistry interfaces.
 func deleteWith(ctx context.Context, f *deleteFlags, names naming.Scheme, mgr deleter, gh runnerRegistry, ask askFunc, env *Env) error {
+	if len(f.only) > 0 {
+		return deleteInstancesWith(ctx, f, names, mgr, gh, ask, env)
+	}
+
 	// Preview what teardown would remove so the operator confirms against the
 	// real cloud state, not just a name.
 	fleet, err := mgr.List(ctx, names)
@@ -167,6 +186,133 @@ func deleteWith(ctx context.Context, f *deleteFlags, names naming.Scheme, mgr de
 	}
 	fmt.Fprintf(env.Stdout, "\nDeleted deployment %q.\n", f.name)
 	return nil
+}
+
+// deleteInstancesWith is the -only path of delete: it removes the named
+// instances with their boot volumes and deregisters their runners, and leaves
+// the rest of the deployment, the shared network included, exactly as it is.
+// The sequence mirrors the whole-deployment path: look the runners up first,
+// preview both sides, confirm once, delete the cloud side, then deregister.
+//
+// Unlike create's scale-down, which only ever removes from the top, this
+// removes any index, so it leaves a gap in the numbering. The next create of
+// the same count fills that gap with a fresh instance, which is also how a
+// deleted instance is brought back.
+func deleteInstancesWith(ctx context.Context, f *deleteFlags, names naming.Scheme, mgr deleter, gh runnerRegistry, ask askFunc, env *Env) error {
+	fleet, err := mgr.List(ctx, names)
+	if err != nil {
+		return fmt.Errorf("discover resources for %s: %w", f.name, err)
+	}
+	plan := openstack.PlanRemove(fleet, names, f.only)
+	printRemovePlan(env.Stdout, names, f.only, plan)
+
+	// As in the whole-deployment path, the runners are looked up before
+	// anything is deleted. The repositories come from every instance of the
+	// deployment, not only the ones being removed, so a runner whose instance
+	// is already gone is still found through its siblings' metadata.
+	var runners []registeredRunner
+	if f.keepRunners {
+		fmt.Fprintln(env.Stdout, "  Runners : left registered with GitHub (-keep-runners)")
+	} else {
+		repos := runnerRepos(f.repo, fleet)
+		runners, err = findRunners(ctx, gh, names, repos)
+		if err != nil {
+			return err
+		}
+		runners = runnersAt(runners, names, f.only)
+		printRunners(env.Stdout, repos, runners)
+	}
+
+	if !plan.HasWork() && len(runners) == 0 {
+		fmt.Fprintf(env.Stdout, "Nothing to delete for %s of deployment %q.\n", joinServerNames(names, f.only), f.name)
+		return nil
+	}
+
+	if !f.assumeYes {
+		ok, err := confirm(ask, fmt.Sprintf("Delete the instance(s) above of deployment %q? The rest of the deployment stays.", f.name))
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Fprintln(env.Stdout, "Aborted; nothing was deleted.")
+			return nil
+		}
+	}
+
+	var errs []error
+	if plan.HasWork() {
+		if err := mgr.Remove(ctx, plan); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := deregisterRunners(ctx, gh, runners, env.Stdout); err != nil {
+		errs = append(errs, fmt.Errorf("%w\nretry with `delete -name %s -only %s -repo <url>` once their jobs have ended, or remove them under Settings -> Actions -> Runners", err, f.name, joinCounters(f.only)))
+	}
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("delete of %s did not fully complete: %w", joinServerNames(names, f.only), err)
+	}
+	fmt.Fprintf(env.Stdout, "\nDeleted %s; the rest of deployment %q stays.\n", joinServerNames(names, f.only), f.name)
+	fmt.Fprintf(env.Stdout, "The gap is filled again by the next `create -name %s` whose -count covers it; `update -name %s -only %s` rebuilds it right away.\n", f.name, f.name, joinCounters(f.only))
+	return nil
+}
+
+// printRemovePlan renders the cloud side of a -only delete: for each named
+// index, the instance and boot volume that will go, or that nothing of it is
+// left in the cloud (the runner may still be registered, which is why the
+// index is not simply dropped).
+func printRemovePlan(out io.Writer, names naming.Scheme, only []int, plan openstack.ReconcilePlan) {
+	servers := map[int]openstack.ServerRef{}
+	for _, s := range plan.InstancesToDelete {
+		if idx, ok := names.IndexOf(s.Name); ok {
+			servers[idx] = s
+		}
+	}
+	volumes := map[int]openstack.ResourceRef{}
+	for _, v := range plan.VolumesToDelete {
+		if idx, ok := names.IndexOf(v.Name); ok {
+			volumes[idx] = v
+		}
+	}
+	fmt.Fprintf(out, "Deployment %q (prefix %s), instances to delete:\n", names.Project, names.Prefix())
+	for _, idx := range only {
+		s, hasServer := servers[idx]
+		v, hasVolume := volumes[idx]
+		switch {
+		case hasServer && hasVolume:
+			fmt.Fprintf(out, "    %-16s %-8s %s%s, with boot volume %s\n", s.Name, s.Status, s.ID, serverShape(s), v.ID)
+		case hasServer:
+			fmt.Fprintf(out, "    %-16s %-8s %s%s\n", s.Name, s.Status, s.ID, serverShape(s))
+		case hasVolume:
+			fmt.Fprintf(out, "    %-16s no instance; leftover boot volume %s%s\n", names.Server(idx), v.ID, volumeShape(v))
+		default:
+			fmt.Fprintf(out, "    %-16s nothing left in the cloud\n", names.Server(idx))
+		}
+	}
+	fmt.Fprintln(out, "  The network, subnet, router, keypair, and every other instance stay.")
+}
+
+// runnersAt keeps the runners named like one of the given instance counters.
+func runnersAt(runners []registeredRunner, names naming.Scheme, only []int) []registeredRunner {
+	wanted := map[int]bool{}
+	for _, idx := range only {
+		wanted[idx] = true
+	}
+	var kept []registeredRunner
+	for _, r := range runners {
+		if idx, ok := names.IndexOf(r.Name); ok && wanted[idx] {
+			kept = append(kept, r)
+		}
+	}
+	return kept
+}
+
+// joinCounters renders instance counters the way -only takes them.
+func joinCounters(idxs []int) string {
+	parts := make([]string, len(idxs))
+	for i, idx := range idxs {
+		parts[i] = strconv.Itoa(idx)
+	}
+	return strings.Join(parts, ",")
 }
 
 // runnerRepos returns the repositories to deregister the runners from: the

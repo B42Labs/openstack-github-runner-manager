@@ -369,6 +369,23 @@ func (m *Manager) deleteInstances(ctx context.Context, plan ReconcilePlan) error
 	return m.deleteServersAndVolumes(ctx, "surplus", plan.InstancesToDelete, plan.VolumesToDelete)
 }
 
+// Remove executes a plan that only deletes: the instances in
+// plan.InstancesToDelete and the boot volumes in plan.VolumesToDelete, in the
+// same sequence a scale-down uses, and nothing else. It is the executor of
+// PlanRemove, the per-instance counterpart to Teardown: the shared network,
+// router, and keypair stay, and so does every instance the plan does not
+// name. The create side of the plan is ignored, so a plan with instances to
+// create is a programming error and refused.
+func (m *Manager) Remove(ctx context.Context, plan ReconcilePlan) error {
+	if len(plan.InstancesToCreate) > 0 || len(plan.InstancesToReplace) > 0 {
+		return fmt.Errorf("remove was handed a plan that creates instances")
+	}
+	if len(plan.InstancesToDelete) == 0 && len(plan.VolumesToDelete) == 0 {
+		return nil
+	}
+	return m.deleteServersAndVolumes(ctx, "selected", plan.InstancesToDelete, plan.VolumesToDelete)
+}
+
 // replaceInstances tears down the instances the plan replaces — the ones
 // PlanReconcile found in ERROR, or the healthy one a rolling update rebuilds —
 // together with their boot volumes, so the create phase that follows rebuilds
