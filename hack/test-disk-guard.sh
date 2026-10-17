@@ -34,8 +34,10 @@ mkdir -p "${WORK}/bin" "${RUNNER}/_work/_temp" "${RUNNER}/_work/_actions" "${RUN
 # install.sh emits the guard in two parts: a generated header with this
 # instance's values, then the body verbatim from a quoted heredoc. Take that
 # same body and give it a header pointing at the sandbox, so the test runs the
-# real script rather than a copy that can drift from it.
+# real script rather than a copy that can drift from it. The hook budget is cut
+# to a few seconds, so a case can outlast it without making the test slow.
 GUARD="${WORK}/disk-guard.sh"
+BUDGET=3
 {
   printf '#!/usr/bin/env bash\n'
   printf "RUNNER_USER='%s'\n" "$(id -un)"
@@ -48,6 +50,7 @@ awk '/^  cat >> "\$\{OGRM_DIR\}\/disk-guard\.sh" <<.GUARD.$/ { inside = 1; next 
      inside' "${SRC}" \
   | sed -e "s|^MARKER=/run/ogrm/job-active|MARKER=${WORK}/run/job-active|" \
         -e "s|install -d -m 0755 /run/ogrm|install -d -m 0755 ${WORK}/run|" \
+        -e "s|^HOOK_BUDGET_SECONDS=60$|HOOK_BUDGET_SECONDS=${BUDGET}|" \
   >> "${GUARD}"
 chmod +x "${GUARD}"
 
@@ -56,11 +59,16 @@ if ! grep -q '^case "${1:-report}" in' "${GUARD}"; then
   echo "FAIL: could not extract the guard body from ${SRC} (did the heredoc marker change?)" >&2
   exit 1
 fi
+if ! grep -q "^HOOK_BUDGET_SECONDS=${BUDGET}$" "${GUARD}"; then
+  echo "FAIL: could not shorten the hook budget in ${SRC} (did HOOK_BUDGET_SECONDS=60 change?)" >&2
+  exit 1
+fi
 bash -n "${GUARD}"
 
 # --- stubs --------------------------------------------------------------------
 # Each stub appends its full command line to ${CALLS} and succeeds. `docker
-# info` must succeed for the guard to consider Docker usable; `kind get
+# info` must succeed for the guard to consider Docker usable; `docker system
+# prune` takes PRUNE_SECONDS, standing in for a large backlog; `kind get
 # clusters` reports whatever KIND_CLUSTERS says; `sudo` just runs the command it
 # was handed, dropping its own options, so `sudo -u user kind ...` still lands
 # in the log as a kind call.
@@ -71,6 +79,11 @@ for cmd in docker kind journalctl apt-get systemd-tmpfiles sudo; do
 echo "${cmd} \$*" >> "${CALLS}"
 case "${cmd}:\${1:-}" in
   docker:info) exit 0 ;;
+  docker:system)
+    # exec, so the guard's timeout signals the sleep itself rather than a
+    # shell that would die and leave it running.
+    [[ -n "\${PRUNE_SECONDS:-}" ]] && exec sleep "\${PRUNE_SECONDS}"
+    exit 0 ;;
   kind:get)
     if [[ -n "\${KIND_CLUSTERS:-}" ]]; then echo "\${KIND_CLUSTERS}"; else echo "No kind clusters found." >&2; fi
     exit 0 ;;
@@ -163,6 +176,37 @@ not_called "system prune"        # below the threshold the next job keeps its im
 start "post-job on a tight disk escalates to the caches"
 run 91 post-job > /dev/null
 called "docker system prune -af --volumes"
+called "apt-get -y autoremove --purge"
+
+# A hook runs on the job's clock, so a backlog that takes longer to prune than
+# the hook's budget must not hold the job: the prune is cut off and the rest
+# left to a later pass.
+start "post-job stops a hard reclaim that outlasts its budget"
+t0=${SECONDS}
+PRUNE_SECONDS=30 run 91 post-job > "${WORK}/post.out"
+(( SECONDS - t0 < BUDGET + 5 )) || fail "post-job took $((SECONDS - t0))s on a ${BUDGET}s budget"
+called "docker system prune -af --volumes"
+not_called "builder prune -af"
+# Removing the caches is never cut off half-way, so it does not start without
+# the time to finish.
+not_called "autoremove"
+grep -q 'out of time' "${WORK}/post.out" || fail "a pass cut short must say so in the job log"
+
+start "pre-job stops a hard reclaim that outlasts its budget, and warns"
+t0=${SECONDS}
+PRUNE_SECONDS=30 run 91 pre-job > "${WORK}/pre.out"
+(( SECONDS - t0 < BUDGET + 5 )) || fail "pre-job took $((SECONDS - t0))s on a ${BUDGET}s budget"
+called "docker system prune -af --volumes"
+grep -q 'out of time' "${WORK}/pre.out" || fail "a pass cut short must say so in the job log"
+grep -q 'WARNING: still at or above' "${WORK}/pre.out" \
+  || fail "a job that starts on a full disk must be warned in its own log"
+
+start "the timer, which no job waits on, lets a slow reclaim finish"
+rm -f "${WORK}/run/job-active"
+t0=${SECONDS}
+PRUNE_SECONDS=$((BUDGET + 1)) run 91 timer > /dev/null
+(( SECONDS - t0 >= BUDGET + 1 )) || fail "the timer cut its reclaim short"
+called "docker builder prune -af"
 called "apt-get -y autoremove --purge"
 
 start "a job marker left by a job that died is ignored"
