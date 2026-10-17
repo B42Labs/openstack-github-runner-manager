@@ -218,12 +218,27 @@ stops being gentle and also drops every unused image and volume, the whole build
 cache, the runner's `_actions`/`_tool` caches, and purgeable packages. The next
 job re-downloads them; that is the point where being slow beats being full.
 
+In a job hook, that escalation stops after 60 seconds. A hook runs on the job's
+clock: the runner counts it against the job's `timeout-minutes`, and GitHub has
+no separate limit for hooks. Pruning a backlog of about 100 GB takes more than
+ten minutes, enough to cancel a job whose steps all passed. When the time is up
+the guard cancels the prune. Docker stops it between two objects and keeps what
+it already removed, and the next hook or the timer takes the rest. The runner
+caches are cleared only by a pass that still has time left. Deleting the
+finished job's KinD clusters is never cut short, because a half-deleted cluster
+would fail the next job's `kind create cluster`. The cost is that a busy runner
+with a large backlog can stay above the threshold for several jobs. Each of
+them then gives up at most about a minute at its start and another at its end,
+and the pre-job warning says so in the job log.
+
 A systemd timer (`ogrm-disk-guard.timer`, firing every `-disk-guard-interval`,
 15m by default) is the safety net for jobs whose completed hook never ran — a
-cancelled job, a runner crash, a reboot — and for a disk that fills during one
-long job. While a job is in flight the timer only takes what cannot belong to
-that job (entries older than two hours, no cluster deletions); with the runner
-idle it does the full pass. Below the threshold it does nothing at all.
+cancelled job, a runner crash, a reboot — for a disk that fills during one
+long job, and for the backlog a hook ran out of time for. While a job is in
+flight the timer only takes what cannot belong to that job (entries older than
+two hours, no cluster deletions); with the runner idle it does the full pass,
+without a time limit, since no job waits on it. Below the threshold it does
+nothing at all.
 
 On an instance:
 
@@ -655,7 +670,8 @@ The disk guard is shell, so it has its own test
 points it at a throw-away directory, and drives every subcommand with
 `docker`/`kind`/`journalctl`/`apt-get` stubbed out, asserting which reclaim
 steps run — and, just as importantly, which do not (no cluster deletions while a
-job is in flight; no cache purge in the pre-job hook). It needs neither root nor
+job is in flight; no cache purge in the pre-job hook; no hook pruning past its
+time budget). It needs neither root nor
 Docker, and runs as part of `make test`:
 
 ```shell

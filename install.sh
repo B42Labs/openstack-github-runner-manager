@@ -439,11 +439,14 @@ fi
 #                   the important one: it runs when the job's containers are
 #                   garbage by definition, so it cannot race a live workload.
 #   * a timer     - the safety net for the jobs whose completed hook never ran
-#                   (cancelled job, runner crash, reboot) and for a disk that
-#                   fills while a long job is in flight.
+#                   (cancelled job, runner crash, reboot), for a disk that
+#                   fills while a long job is in flight, and for the backlog a
+#                   hook ran out of time for.
 #   * escalation  - the routine post-job pass keeps tagged images and tool
 #                   caches so the next job stays fast; only once usage reaches
 #                   DISK_GUARD_THRESHOLD does the guard throw those away too.
+#                   A hook runs on the job's clock, so there the escalation
+#                   stops after a fixed time budget; the timer has no limit.
 #
 # The guard runs as root (it vacuums the journal and the apt cache), the hooks
 # run as ${RUNNER_USER}, so a sudoers drop-in lets that one user call exactly
@@ -518,6 +521,8 @@ EOF
 #                          created a cluster is over.
 #   reclaim_docker         every unused image, volume and the whole build
 #                          cache. Correct but expensive: the next job re-pulls.
+#                          In a job hook it stops once the hook's time budget
+#                          is spent and leaves the rest to a later pass.
 #   reclaim_runner_caches  the runner's _actions/_tool caches and purgeable
 #                          packages. Never touches _work/_temp, which holds the
 #                          file-command state of the job *and of the hook that
@@ -531,6 +536,17 @@ MARKER=/run/ogrm/job-active
 # hook; it must not block reclaiming forever. /run is a tmpfs, so a reboot
 # clears the marker anyway.
 MARKER_STALE_MINUTES=360
+
+# A job hook runs on the job's clock: the runner counts it against the job's
+# timeout-minutes, and GitHub has no separate limit for hooks. Pruning a large
+# backlog takes minutes, and charging all of it to the one job that pushed the
+# disk over the threshold can cancel a job whose steps all passed. So a hook
+# stops pruning after this many seconds and leaves the rest to the next pass or
+# to the timer, which no job waits on.
+HOOK_BUDGET_SECONDS=60
+# The value of $SECONDS at which the current hook's budget runs out; empty
+# (the timer, a report) means no limit.
+DEADLINE=
 
 log() { printf '[ogrm-disk-guard] %s\n' "$*"; }
 
@@ -565,6 +581,21 @@ mark_job_inactive() { rm -f "${MARKER}"; }
 
 docker_up() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }
 
+budget_spent() { [[ -n "${DEADLINE}" ]] && (( SECONDS >= DEADLINE )); }
+
+# in_budget runs a Docker prune, cut off when the hook's budget runs out. Only
+# a prune goes through here, because only a prune is safe to cut off: the
+# daemon stops it between two objects once its client is gone, and what it
+# already removed stays removed. An interrupted apt-get leaves dpkg broken, an
+# interrupted rm can leave a tool cache marked complete with half its files
+# gone, and a half-deleted KinD cluster fails the next job's `kind create`.
+in_budget() {
+  [[ -n "${DEADLINE}" ]] || { "$@"; return; }
+  local left=$(( DEADLINE - SECONDS ))
+  (( left > 0 )) || return 124
+  timeout -k 5 "${left}" "$@"
+}
+
 reclaim_safe() {
   log "reclaiming: logs, package cache, dangling Docker data"
   journalctl --vacuum-size=200M >/dev/null 2>&1
@@ -577,9 +608,9 @@ reclaim_safe() {
   if job_active; then
     filter=(--filter until=2h)
   fi
-  docker container prune -f "${filter[@]}" >/dev/null 2>&1
-  docker image prune -f "${filter[@]}" >/dev/null 2>&1
-  docker builder prune -f "${filter[@]}" >/dev/null 2>&1
+  in_budget docker container prune -f "${filter[@]}" >/dev/null 2>&1
+  in_budget docker image prune -f "${filter[@]}" >/dev/null 2>&1
+  in_budget docker builder prune -f "${filter[@]}" >/dev/null 2>&1
 }
 
 reclaim_clusters() {
@@ -595,8 +626,11 @@ reclaim_clusters() {
 reclaim_docker() {
   docker_up || return 0
   log "reclaiming hard: every unused image and volume, the whole build cache"
-  docker system prune -af --volumes >/dev/null 2>&1
-  docker builder prune -af >/dev/null 2>&1
+  in_budget docker system prune -af --volumes >/dev/null 2>&1
+  in_budget docker builder prune -af >/dev/null 2>&1
+  if budget_spent; then
+    log "out of time after ${HOOK_BUDGET_SECONDS}s, the most a hook may add to its job; the next pass or the timer reclaims the rest"
+  fi
 }
 
 reclaim_runner_caches() {
@@ -612,6 +646,7 @@ purge_work_temp() {
 
 case "${1:-report}" in
   pre-job)
+    DEADLINE=$(( SECONDS + HOOK_BUDGET_SECONDS ))
     mark_job_active
     report
     if above_threshold; then
@@ -632,14 +667,19 @@ case "${1:-report}" in
     fi
     ;;
   post-job)
-    # Clear the marker first: everything below is now running between jobs.
+    # Clear the marker first: no container of the finished job is live any
+    # more. Its clock still runs until this hook exits, though, so the pass
+    # keeps to the hook's budget like the pre-job one.
+    DEADLINE=$(( SECONDS + HOOK_BUDGET_SECONDS ))
     mark_job_inactive
     reclaim_clusters
     reclaim_safe
     if above_threshold; then
       log "still at or above ${THRESHOLD}% after the routine sweep"
       reclaim_docker
-      reclaim_runner_caches
+      # Removing the caches cannot be cut off half-way, so it only starts
+      # while there is time left.
+      budget_spent || reclaim_runner_caches
     fi
     report
     ;;
