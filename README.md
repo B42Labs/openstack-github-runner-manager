@@ -47,6 +47,7 @@ Each instance receives cloud-init user-data that, in order:
    repository URL, that instance's registration token, the runner name, and the
    disk guard settings,
 3. runs `install.sh`, which installs the [runner toolbox](#what-is-preinstalled),
+   turns [unattended upgrades off](#package-upgrades-on-the-instances),
    registers the GitHub Actions runner as a systemd service, and installs the
    [disk guard](#keeping-the-disk-from-filling-up),
 4. reboots, so the upgraded kernel is active and the runner service comes up
@@ -258,6 +259,40 @@ workload needs more room than the volume has: raise `-volume-size` for the
 instances you create next. Existing instances keep the volume they were built
 with, so replacing them (or growing the fleet) is what changes it.
 
+## Package upgrades on the instances
+
+Unattended upgrades are off on every instance, because a package upgrade under
+a running job can stop that job. Ubuntu runs needrestart after every dpkg run,
+and under APT it restarts each service that still uses an upgraded library, the
+runner service among them. On 2026-11-17 the runner service was stopped under
+two running jobs, on two hosts eight minutes apart, inside the 06:00 to 07:00
+UTC window of Ubuntu's daily upgrade (`apt-daily-upgrade.timer`). The host logs
+that would prove the upgrade was the trigger were never read. With the upgrade
+off and the runner exempt from needrestart, the cause is gone either way.
+
+`install.sh` writes two files for this, before its own first `apt-get`, with
+the disk guard on or off:
+
+- `/etc/apt/apt.conf.d/99-ogrm-no-unattended-upgrades` sets
+  `APT::Periodic::Unattended-Upgrade "0"`. It sorts after the image's
+  `20auto-upgrades`, so its value wins. `APT::Periodic::Update-Package-Lists`
+  stays on: the package lists keep refreshing, so a job's own `apt-get install`
+  does not meet stale ones.
+- `/etc/needrestart/conf.d/99-ogrm-runner.conf` tells needrestart never to
+  restart a unit matching `actions.runner.*`. That covers the dpkg runs that
+  remain: the disk guard's `apt-get autoremove` after a job, and a job's own
+  `sudo apt-get install`.
+
+An instance has its packages upgraded when it is built (step 1 under
+[What it creates](#what-it-creates)) and again every time
+[`ogrm update`](#update) rebuilds it. Its patch level is as old as its last
+rebuild, so rolling `update` through the fleet is how it gets patched. There is
+no flag to keep unattended upgrades on; removing the apt file on a host turns
+them back on there.
+
+Instances built before this change keep unattended upgrades until they are
+rebuilt.
+
 ## Naming scheme
 
 Every resource shares the prefix `ogrm-<name>-`, which together with the
@@ -375,10 +410,11 @@ serve it.
 ## Build
 
 ```shell
-make build            # -> bin/ogrm
-make test             # every unit test (Go and the disk guard)
-make test-go          # only the Go tests
-make test-disk-guard  # only the disk guard's decision table
+make build                # -> bin/ogrm
+make test                 # every unit test (Go, the disk guard, the upgrade config)
+make test-go              # only the Go tests
+make test-disk-guard      # only the disk guard's decision table
+make test-upgrade-config  # only the parse of the needrestart and apt files
 make vet
 ```
 
@@ -671,8 +707,15 @@ points it at a throw-away directory, and drives every subcommand with
 `docker`/`kind`/`journalctl`/`apt-get` stubbed out, asserting which reclaim
 steps run — and, just as importantly, which do not (no cluster deletions while a
 job is in flight; no cache purge in the pre-job hook; no hook pruning past its
-time budget). It needs neither root nor
-Docker, and runs as part of `make test`:
+time budget). It needs neither root nor Docker.
+
+The two package-management files `install.sh` writes have a test of their own
+(`hack/test-upgrade-config.sh`). It extracts both from `install.sh`, evaluates
+the needrestart snippet the way needrestart's own configuration loads it,
+checks that the runner service is never selected for a restart while `docker`
+keeps its stock exemption and other services do not gain one, and parses the
+apt file with `apt-config` where the machine has it. It needs `perl`. Both
+tests run as part of `make test`:
 
 ```shell
 make test
