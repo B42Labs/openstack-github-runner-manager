@@ -238,15 +238,60 @@ cancelled job, a runner crash, a reboot — for a disk that fills during one
 long job, and for the backlog a hook ran out of time for. While a job is in
 flight the timer only takes what cannot belong to that job (entries older than
 two hours, no cluster deletions); with the runner idle it does the full pass,
-without a time limit, since no job waits on it. Below the threshold it does
-nothing at all.
+without a time limit, since no job waits on it. Below the threshold it reclaims
+nothing.
+
+**Where the space is.** The usage line says how full the filesystem is, not
+what fills it, so the guard also keeps a breakdown: the largest directories on
+the filesystem that holds `/var/lib/docker`, down to four levels below its
+mount point, and Docker's own accounting from `docker system df`. The pre-job
+hook prints the stored breakdown into every job's log, right after the usage
+line. An example, with invented numbers:
+
+```text
+[ogrm-disk-guard] /var/lib/docker: 118G of 193G used (62%), 75G free
+[ogrm-disk-guard] breakdown of /, measured 2026-11-18T03:12:07Z with no job running: 118G used, 116.2G in files
+[ogrm-disk-guard]   109.3G /var
+[ogrm-disk-guard]   108.9G /var/lib
+[ogrm-disk-guard]   108.1G /var/lib/docker
+[ogrm-disk-guard]   71.0G /var/lib/docker/volumes
+[ogrm-disk-guard] docker: Images 14.2GB (13.1GB (92%) reclaimable), Containers 0B (0B (0%) reclaimable), Local Volumes 71GB (71GB (100%) reclaimable), Build Cache 0B (0B reclaimable)
+```
+
+Walking the filesystem takes minutes and competes with a job for IO, so a hook
+never measures; it only prints what is stored, and the header line carries the
+time it was measured. The timer measures, and only while no job runs: after
+every full reclaim, and otherwise once the stored breakdown is more than six
+hours old. `du` and `docker system df` run at idle CPU and IO priority and are
+each cut off after ten minutes, and the breakdown then says so instead of
+listing directories. A runner that is busy at every timer tick keeps its last
+breakdown. The breakdown lives on the `/run` tmpfs, so after a reboot the hook
+prints `breakdown: not measured yet` until the timer's first pass, five minutes
+after boot.
+
+The directory sizes are `du`'s, in GiB; Docker's figures are its own, in
+decimal GB. The header puts the used space `df` reports next to what `du`
+found in files. A gap between the two is space no directory accounts for, such
+as files deleted while a process still holds them open. Directory names are
+written by jobs and printed into another job's log, so every character outside
+letters, digits, and `._/+@=,-` is shown as `?`. A job step can measure a fresh
+breakdown at the moment it fails, with its job still running:
+
+```yaml
+- if: failure()
+  run: sudo -n /opt/ogrm/disk-guard.sh breakdown
+```
+
+That step runs on the job's clock, for up to twice ten minutes on a filesystem
+too large to walk.
 
 On an instance:
 
 ```shell
-sudo /opt/ogrm/disk-guard.sh report   # what the guard sees right now
-sudo /opt/ogrm/disk-guard.sh timer    # force a check instead of waiting
-journalctl -u ogrm-disk-guard         # what it has been reclaiming
+sudo /opt/ogrm/disk-guard.sh report      # what the guard sees right now
+sudo /opt/ogrm/disk-guard.sh breakdown   # measure where the space is, now
+sudo /opt/ogrm/disk-guard.sh timer       # force a check instead of waiting
+journalctl -u ogrm-disk-guard            # what it has reclaimed and measured
 ```
 
 `-no-disk-guard` skips all of it — no log caps, no hooks, no timer — for when
@@ -254,10 +299,12 @@ you manage the runner's disk yourself. The guard runs as root (it vacuums the
 journal and the apt cache) and the hooks run as the runner user, so a sudoers
 drop-in lets that one user call exactly the one root-owned guard script.
 
-If the guard reclaims after every job and the disk *still* runs out, the
-workload needs more room than the volume has: raise `-volume-size` for the
-instances you create next. Existing instances keep the volume they were built
-with, so replacing them (or growing the fleet) is what changes it.
+If the guard reclaims after every job and the disk *still* runs out, read the
+breakdown in the failed job's log first: it shows what holds the space the
+guard does not reclaim. When that space belongs to the workload, the workload
+needs more room than the volume has: raise `-volume-size` for the instances you
+create next. Existing instances keep the volume they were built with, so
+replacing them (or growing the fleet) is what changes it.
 
 ## Package upgrades on the instances
 
@@ -704,10 +751,14 @@ whose fake cloud and fake GitHub change state as the loop acts on them.
 The disk guard is shell, so it has its own test
 (`hack/test-disk-guard.sh`): it extracts the guard body out of `install.sh`,
 points it at a throw-away directory, and drives every subcommand with
-`docker`/`kind`/`journalctl`/`apt-get` stubbed out, asserting which reclaim
+`docker`/`kind`/`journalctl`/`apt-get`/`du` stubbed out, asserting which reclaim
 steps run — and, just as importantly, which do not (no cluster deletions while a
 job is in flight; no cache purge in the pre-job hook; no hook pruning past its
-time budget). It needs neither root nor Docker.
+time budget). Its breakdown cases check that only an idle timer and the
+`breakdown` subcommand measure, that the hooks print the stored result or say
+there is none, that a failing `df`, `du`, or Docker is reported in words, and
+that a directory name cannot carry a workflow command into the job log. It
+needs neither root nor Docker.
 
 The two package-management files `install.sh` writes have a test of their own
 (`hack/test-upgrade-config.sh`). It extracts both from `install.sh`, evaluates

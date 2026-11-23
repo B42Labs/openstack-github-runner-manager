@@ -534,7 +534,10 @@ EOF
 #   disk-guard.sh pre-job    invoked by the runner before a job starts
 #   disk-guard.sh post-job   invoked by the runner after a job finished
 #   disk-guard.sh timer      invoked by ogrm-disk-guard.timer
-#   disk-guard.sh report     print the current usage and exit (for humans)
+#   disk-guard.sh report     print the current usage and the stored breakdown
+#                            (for humans)
+#   disk-guard.sh breakdown  measure where the used space is, store it, and
+#                            print it
 #
 # The levels below are ordered by how much they cost the *next* job, and each
 # is only ever called where it is safe:
@@ -566,6 +569,20 @@ MARKER=/run/ogrm/job-active
 # hook; it must not block reclaiming forever. /run is a tmpfs, so a reboot
 # clears the marker anyway.
 MARKER_STALE_MINUTES=360
+
+# What the used space on the guarded filesystem consists of, as last measured
+# by measure_breakdown. On the tmpfs too: after a reboot the hooks say it is
+# not measured yet until the timer's first pass.
+BREAKDOWN=/run/ogrm/breakdown
+# An idle timer measures again once the stored breakdown is this old, and
+# after every full reclaim.
+BREAKDOWN_MAX_AGE_MINUTES=360
+# du and docker system df are each cut off after this long.
+BREAKDOWN_TIMEOUT_SECONDS=600
+# From /, depth 4 reaches /var/lib/docker/overlay2, /var/lib/docker/volumes,
+# /home/ubuntu/actions-runner/_work and /home/ubuntu/go/pkg.
+BREAKDOWN_DEPTH=4
+BREAKDOWN_TOP=12
 
 # A job hook runs on the job's clock: the runner counts it against the job's
 # timeout-minutes, and GitHub has no separate limit for hooks. Pruning a large
@@ -674,11 +691,92 @@ purge_work_temp() {
   rm -rf "${RUNNER_DIR}/_work/_temp"/* 2>/dev/null
 }
 
+# The breakdown names what holds the used space: the largest directories on the
+# guarded filesystem and Docker's own accounting. A walk of the whole
+# filesystem can take minutes and competes with a job for IO, so only an idle
+# timer measures it on its own, and a hook only prints what is stored.
+breakdown_stale() {
+  [[ ! -e "${BREAKDOWN}" ]] \
+    || [[ -n "$(find "${BREAKDOWN}" -mmin "+${BREAKDOWN_MAX_AGE_MINUTES}" 2>/dev/null)" ]]
+}
+
+measure_breakdown() {
+  local mount used when job sizes status total header largest="" docker_line rows tmp
+  mount="$(df -P "${GUARD_PATH}" 2>/dev/null | awk 'NR==2 { print $6 }')"
+  if [[ -z "${mount}" ]]; then
+    log "breakdown: cannot find the filesystem of ${GUARD_PATH}"
+    return 0
+  fi
+  used="$(df -Ph "${GUARD_PATH}" 2>/dev/null | awk 'NR==2 { print $3 }')"
+  when="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if job_active; then job="a job"; else job="no job"; fi
+
+  sizes="$(nice -n 19 ionice -c 3 timeout -k 5 "${BREAKDOWN_TIMEOUT_SECONDS}" \
+    du -x -m --max-depth="${BREAKDOWN_DEPTH}" "${mount}" 2>/dev/null)"
+  status=$?
+  # du prints the filesystem's own line last, so a walk that was cut off lacks
+  # it. A non-zero exit alone proves nothing: a file that vanishes during the
+  # walk makes du exit 1 with complete output.
+  total="$(awk -F'\t' -v mount="${mount}" '$1 ~ /^[0-9]+$/ && $2 == mount { printf "%.1f", $1 / 1024; exit }' <<< "${sizes}")"
+
+  header="breakdown of ${mount}, measured ${when} with ${job} running: ${used} used, "
+  if [[ -n "${total}" ]]; then
+    header+="${total}G in files"
+    # Directory names are written by jobs, and these lines are printed into
+    # another job's log, where the runner acts on ::command:: and ##[command]
+    # sequences. So every character outside a harmless set becomes '?', and a
+    # line that is no "<MiB><TAB>/<path>" - the second half of a name with a
+    # newline in it - is dropped.
+    largest="$(sort -rn <<< "${sizes}" | awk -F'\t' -v mount="${mount}" -v top="${BREAKDOWN_TOP}" '
+      $1 !~ /^[0-9]+$/ || $2 !~ /^\// || $2 == mount { next }
+      n < top { p = $2; gsub(/[^A-Za-z0-9._\/+@=,-]/, "?", p); printf "  %.1fG %s\n", $1 / 1024, p; n++ }')"
+  elif (( status == 124 || status == 137 )); then
+    header+="no directory sizes (du ran out of time after ${BREAKDOWN_TIMEOUT_SECONDS}s)"
+  else
+    header+="no directory sizes (du reported nothing)"
+  fi
+
+  docker_line="not reachable"
+  if docker_up; then
+    if rows="$(timeout -k 5 "${BREAKDOWN_TIMEOUT_SECONDS}" docker system df \
+         --format '{{.Type}} {{.Size}} ({{.Reclaimable}} reclaimable)' 2>/dev/null)" \
+       && [[ -n "${rows}" ]]; then
+      docker_line="${rows//$'\n'/, }"
+    else
+      docker_line="system df failed"
+    fi
+  fi
+
+  # Written beside the stored file and moved over it, so a reader never sees
+  # half of it and two runs at once cannot mix their lines.
+  install -d -m 0755 "$(dirname "${BREAKDOWN}")" || return 0
+  tmp="$(mktemp "${BREAKDOWN}.XXXXXX" 2>/dev/null)" || return 0
+  {
+    printf '%s\n' "${header}"
+    [[ -n "${largest}" ]] && printf '%s\n' "${largest}"
+    printf 'docker: %s\n' "${docker_line}"
+  } > "${tmp}"
+  chmod 0644 "${tmp}"
+  mv -f "${tmp}" "${BREAKDOWN}"
+}
+
+print_breakdown() {
+  local line
+  if [[ ! -f "${BREAKDOWN}" ]]; then
+    log "breakdown: not measured yet (the timer measures it while no job runs)"
+    return 0
+  fi
+  while IFS= read -r line; do
+    log "${line}"
+  done < "${BREAKDOWN}"
+}
+
 case "${1:-report}" in
   pre-job)
     DEADLINE=$(( SECONDS + HOOK_BUDGET_SECONDS ))
     mark_job_active
     report
+    print_breakdown
     if above_threshold; then
       log "at or above ${THRESHOLD}% before the job starts; reclaiming now"
       reclaim_safe
@@ -714,25 +812,42 @@ case "${1:-report}" in
     report
     ;;
   timer)
-    above_threshold || exit 0
-    if job_active; then
-      log "at or above ${THRESHOLD}% while a job is running; safe reclaim only"
-      reclaim_safe
-    else
-      log "at or above ${THRESHOLD}% with no job running; full reclaim"
-      reclaim_safe
-      reclaim_clusters
-      reclaim_docker
-      reclaim_runner_caches
-      purge_work_temp
+    reclaimed=false
+    if above_threshold; then
+      reclaimed=true
+      if job_active; then
+        log "at or above ${THRESHOLD}% while a job is running; safe reclaim only"
+        reclaim_safe
+      else
+        log "at or above ${THRESHOLD}% with no job running; full reclaim"
+        reclaim_safe
+        reclaim_clusters
+        reclaim_docker
+        reclaim_runner_caches
+        purge_work_temp
+      fi
+      report
     fi
-    report
+    # Below the threshold with a recent breakdown stored, a pass runs no
+    # command and prints nothing.
+    if ! job_active && { [[ "${reclaimed}" == true ]] || breakdown_stale; }; then
+      measure_breakdown
+      print_breakdown
+    fi
     ;;
   report)
     report
+    print_breakdown
+    ;;
+  breakdown)
+    # Measures even with a job running: a job step may call this to see where
+    # its space went at the moment it fails.
+    report
+    measure_breakdown
+    print_breakdown
     ;;
   *)
-    echo "usage: $0 <pre-job|post-job|timer|report>" >&2
+    echo "usage: $0 <pre-job|post-job|timer|report|breakdown>" >&2
     exit 2
     ;;
 esac
